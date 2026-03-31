@@ -7,10 +7,19 @@
 #include <string>
 #include <sstream>
 #include <chrono>
+#include <memory>
+
+enum class Liveness : uint8_t {
+    Alive = 1,
+    Dead = 2,
+    Uninitialized = 3
+};
 
 struct PeerInfo {
     float load = 0.0f;  // current load
     std::chrono::steady_clock::time_point last_heartbeat; // timestamp
+    std::unique_ptr<zmq::socket_t> dealer;
+    Liveness status = Liveness::Uninitialized;
 };
 
 std::string getLoadAverage() {
@@ -78,22 +87,21 @@ int main(int argc, char* argv[]) {
 
     // Create a vector of DEALER sockets for all other nodes
     std::vector<PeerInfo> peers(num_nodes);
-    std::vector<zmq::socket_t> dealers(num_nodes);
 
     for (int j = 0; j < num_nodes; ++j) {
         if (j == node_id) continue;
 
         // Initialize DEALER socket for peer j
-        dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
+        peers[j].dealer = std::make_unique<zmq::socket_t>(context, zmq::socket_type::dealer);
 
         // Set the DEALER identity to our node's ID
-        dealers[j].set(zmq::sockopt::routing_id, identity);
+        peers[j].dealer->set(zmq::sockopt::routing_id, identity);
 
         // Prevents the socket from remaining open after quitting forcefully
-        dealers[j].set(zmq::sockopt::linger, 0);
+        peers[j].dealer->set(zmq::sockopt::linger, 0);
 
         // Connect to the peer's address
-        dealers[j].connect(addresses[j]);
+        peers[j].dealer->connect(addresses[j]);
 
         // Send initial "hello world" to the peer
         MessageType type = MessageType::Heartbeat;
@@ -101,15 +109,21 @@ int main(int argc, char* argv[]) {
 
         // Convert enum to byte
         uint8_t type_byte = static_cast<uint8_t>(type);
-        zmq::message_t type_frame(&type_byte, sizeof(type_byte));  // 1-byte frame
+        zmq::message_t type_frame(sizeof(uint8_t));  // 1-byte frame
+        memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
         zmq::message_t payload_frame(payload.begin(), payload.end());
 
         // Send
-        dealers[j].send(type_frame, zmq::send_flags::sndmore);
-        dealers[j].send(payload_frame, zmq::send_flags::none);
+        peers[j].dealer->send(type_frame, zmq::send_flags::sndmore);
+        peers[j].dealer->send(payload_frame, zmq::send_flags::none);
 
         std::cout << "Connected DEALER to node " << j << " and sent load : " << payload << std::endl;
     }
+
+    // TODO: Ajouter un thread (ou similaire) qui envoie notre heartbeat à tous les peers alive, toutes les 3 secondes.
+    // Il doit également checker qu'aucun pair n'est alive avec une date de dernier heartbeat supérieure à 10 secondes.
+    // Sinon, le pair en question doit être switché à l'état dead.
+    // NB: les sockets ZeroMQ ne sont pas thread safe.
 
     // Receive loop
     while (true) {
@@ -127,17 +141,28 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Message received from " << sender_id << " [" << static_cast<int>(type) << "]: " << message << std::endl;
 
+        int indice = std::stoi(sender_id);
+        if (peers[indice].status == Liveness::Dead) {
+            std::cout << "Peer " << sender_id << " came back to life but we'll pretend we haven't seen anything." << std::endl;
+            continue;
+        }
+
         switch(type) {
             case MessageType::Heartbeat: {
+                peers[indice].load = std::stof(message);
+                peers[indice].status = Liveness::Alive;
+                peers[indice].last_heartbeat = std::chrono::steady_clock::now();
+
                 break;
             }
             
             case MessageType::ClientCommand: {
-                response_type = MessageType::ClientReturnValue;
-                response_payload = "Command received: " + message;
+                MessageType response_type = MessageType::ClientReturnValue;
+                std::string response_payload = "Command received: " + message;
 
                 uint8_t resp_type_byte = static_cast<uint8_t>(response_type);
-                zmq::message_t resp_type_frame(&resp_type_byte, sizeof(resp_type_byte));  // 1-byte frame
+                zmq::message_t resp_type_frame(sizeof(uint8_t));  // 1-byte frame
+                memcpy(resp_type_frame.data(), &resp_type_byte, sizeof(uint8_t));
                 zmq::message_t resp_payload_frame(response_payload.begin(), response_payload.end());
 
                 router.send(sender, zmq::send_flags::sndmore);
@@ -148,11 +173,12 @@ int main(int argc, char* argv[]) {
             }
 
             case MessageType::ClientHandshake: {
-                response_type = MessageType::ClientAcknowledgement;
-                response_payload = "";
+                MessageType response_type = MessageType::ClientAcknowledgement;
+                std::string response_payload = "";
 
                 uint8_t resp_type_byte = static_cast<uint8_t>(response_type);
-                zmq::message_t resp_type_frame(&resp_type_byte, sizeof(resp_type_byte));  // 1-byte frame
+                zmq::message_t resp_type_frame(sizeof(uint8_t));  // 1-byte frame
+                memcpy(resp_type_frame.data(), &resp_type_byte, sizeof(uint8_t));
                 zmq::message_t resp_payload_frame(response_payload.begin(), response_payload.end());
 
                 router.send(sender, zmq::send_flags::sndmore);
