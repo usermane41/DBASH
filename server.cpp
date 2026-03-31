@@ -8,6 +8,7 @@
 #include <sstream>
 #include <chrono>
 #include <memory>
+#include <thread>
 
 enum class Liveness : uint8_t {
     Alive = 1,
@@ -43,6 +44,7 @@ int main(int argc, char* argv[]) {
     }
 
     int node_id = std::stoi(argv[1]);
+    std::mutex peers_mutex;
 
     // Hardcoded config path
     const std::string config_path = "./config_servers.txt";
@@ -120,10 +122,95 @@ int main(int argc, char* argv[]) {
         std::cout << "Connected DEALER to node " << j << " and sent load : " << payload << std::endl;
     }
 
-    // TODO: Ajouter un thread (ou similaire) qui envoie notre heartbeat à tous les peers alive, toutes les 3 secondes.
+    // Thread qui envoie notre heartbeat à tous les peers alive, toutes les 3 secondes.
     // Il doit également checker qu'aucun pair n'est alive avec une date de dernier heartbeat supérieure à 10 secondes.
     // Sinon, le pair en question doit être switché à l'état dead.
     // NB: les sockets ZeroMQ ne sont pas thread safe.
+    void heartbeat_thread(
+        int node_id,
+        int num_nodes,
+        std::vector<PeerInfo>& peers,
+        const std::vector<std::string>& addresses,
+        zmq::context_t& context,
+        std::mutex& peers_mutex
+    ) {
+        // ---- Create DEALER sockets ----
+        std::vector<zmq::socket_t> dealers(num_nodes);
+
+        for (int j = 0; j < num_nodes; ++j) {
+            if (j == node_id) continue;
+        
+            dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
+        
+            // identity = "heartbeat_" + j
+            std::string identity = "heartbeat_" + std::to_string(node_id);
+            dealers[j].set(zmq::sockopt::routing_id, identity);
+        
+            // linger = 0
+            dealers[j].set(zmq::sockopt::linger, 0);
+        
+            dealers[j].connect(addresses[j]);
+        
+            std::cout << "[HB] Connected to peer " << j << std::endl;
+        }
+    
+        // ---- Loop forever ----
+        while (true) {
+            auto now = std::chrono::steady_clock::now();
+            std::string payload = getLoadAverage();
+        
+            for (int j = 0; j < num_nodes; ++j) {
+                if (j == node_id) continue;
+                auto& peer = peers[j];
+
+                peers_mutex.lock();
+                Liveness peer_status = peer.status;
+                auto last_heartbeat = peer.last_heartbeat;
+                peers_mutex.unlock();
+            
+                // ---- Liveness check ----
+                if (peer_status == Liveness::Alive) {
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - last_heartbeat
+                    );
+                
+                    if (elapsed.count() > 10) {
+                        peers_mutex.lock();
+                        peer.status = Liveness::Dead;
+                        peers_mutex.unlock();
+
+                        std::cout << "[HB] Peer " << j << " marked DEAD\n";
+                        continue;
+                    }
+
+                    // ---- Send heartbeat ----
+                    MessageType type = MessageType::Heartbeat;
+                    uint8_t type_byte = static_cast<uint8_t>(type);
+                    zmq::message_t type_frame(sizeof(uint8_t));  // 1-byte frame
+                    memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
+                    zmq::message_t payload_frame(payload.begin(), payload.end());
+                    
+                    // Send
+                    dealers[j].send(type_frame, zmq::send_flags::sndmore);
+                    dealers[j].send(payload_frame, zmq::send_flags::none);
+
+                    std::cout << "[HB] Sent to peer " << j << std::endl;
+                }
+            }
+        
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+    }
+
+    std::thread hb_thread(
+        heartbeat_thread,
+        node_id,
+        num_nodes,
+        std::ref(peers),
+        std::cref(addresses),
+        std::ref(context),
+        std::ref(peers_mutex)
+    );
 
     // Receive loop
     while (true) {
@@ -141,17 +228,24 @@ int main(int argc, char* argv[]) {
 
         std::cout << "Message received from " << sender_id << " [" << static_cast<int>(type) << "]: " << message << std::endl;
 
-        int indice = std::stoi(sender_id);
-        if (peers[indice].status == Liveness::Dead) {
-            std::cout << "Peer " << sender_id << " came back to life but we'll pretend we haven't seen anything." << std::endl;
-            continue;
-        }
-
         switch(type) {
             case MessageType::Heartbeat: {
+                int indice = std::stoi(sender_id.substr(10));
+
+                peers_mutex.lock();
+                Liveness peer_status = peers[indice].status;
+                peers_mutex.unlock();
+
+                if (peer_status == Liveness::Dead) {
+                    std::cout << "Peer " << sender_id << " came back to life but we'll pretend we haven't seen anything." << std::endl;
+                    continue;
+                }
+
+                peers_mutex.lock();
                 peers[indice].load = std::stof(message);
                 peers[indice].status = Liveness::Alive;
                 peers[indice].last_heartbeat = std::chrono::steady_clock::now();
+                peers_mutex.unlock();
 
                 break;
             }
