@@ -1,13 +1,3 @@
-// im using zeromq with c++ to build a distributed shell. im currently building the cluster. 
-// i have a config file that is a list of urls+ports (one per line, each representing a node). 
-// write a main function that takes an int as a parameter (it will be the node id), 
-// opens the config file (assume the path is hardcoded), 
-// sets a variable equal to the number of line contained in the config file, creates a router socket, 
-// sets its identity to the id passed as param and its adress to the id-th line of the config file. 
-// then for each line j in the config file, except the id-th line, 
-// it connects the socket to the adress of the line j and sends a hello world message to that peer (its identity will be j). 
-// once that is over, we want to indefinitely read incoming messages on our socket and print them
-
 #include "message_types.hpp"
 
 #include <zmq.hpp>
@@ -23,7 +13,6 @@ struct PeerInfo {
     std::chrono::steady_clock::time_point last_heartbeat; // timestamp
 };
 
-// TODO: Checker que cette fonction retourne effectivement le premier nombre de la ligne
 std::string getLoadAverage() {
     std::ifstream load_file("/proc/loadavg");
     if (!load_file.is_open()) return "error reading loadavg";
@@ -136,7 +125,50 @@ int main(int argc, char* argv[]) {
         MessageType type = static_cast<MessageType>(*static_cast<uint8_t*>(type_frame.data()));
         std::string message(static_cast<char*>(payload_frame.data()), payload_frame.size());
 
-        std::cout << "Received from " << sender_id << " [" << static_cast<int>(type) << "]: " << message << std::endl;
+        std::cout << "Message received from " << sender_id << " [" << static_cast<int>(type) << "]: " << message << std::endl;
+
+        switch(type) {
+            case MessageType::Heartbeat: {
+                break;
+            }
+            
+            case MessageType::ClientCommand: {
+                response_type = MessageType::ClientReturnValue;
+                response_payload = "Command received: " + message;
+
+                uint8_t resp_type_byte = static_cast<uint8_t>(response_type);
+                zmq::message_t resp_type_frame(&resp_type_byte, sizeof(resp_type_byte));  // 1-byte frame
+                zmq::message_t resp_payload_frame(response_payload.begin(), response_payload.end());
+
+                router.send(sender, zmq::send_flags::sndmore);
+                router.send(resp_type_frame, zmq::send_flags::sndmore);
+                router.send(resp_payload_frame, zmq::send_flags::none);
+
+                break;
+            }
+
+            case MessageType::ClientHandshake: {
+                response_type = MessageType::ClientAcknowledgement;
+                response_payload = "";
+
+                uint8_t resp_type_byte = static_cast<uint8_t>(response_type);
+                zmq::message_t resp_type_frame(&resp_type_byte, sizeof(resp_type_byte));  // 1-byte frame
+                zmq::message_t resp_payload_frame(response_payload.begin(), response_payload.end());
+
+                router.send(sender, zmq::send_flags::sndmore);
+                router.send(resp_type_frame, zmq::send_flags::sndmore);
+                router.send(resp_payload_frame, zmq::send_flags::none);
+
+                break;
+            }
+
+            default: {
+                std::cout << "Unknown message type, this indicates an error with the protocol. You should probably switch to E-Bash anyway." << message << std::endl;
+                break;
+            }
+        }
+
+
     }
 
     return 0;
