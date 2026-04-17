@@ -143,7 +143,7 @@ int main(int argc, char* argv[]) {
             dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
         
             // identity = "heartbeat_" + j
-            std::string identity = "heartbeat_" + std::to_string(node_id);
+            std::string identity = "heartbeat_" + std::to_string(j);
             dealers[j].set(zmq::sockopt::routing_id, identity);
         
             // linger = 0
@@ -161,11 +161,10 @@ int main(int argc, char* argv[]) {
         
             for (int j = 0; j < num_nodes; ++j) {
                 if (j == node_id) continue;
-                auto& peer = peers[j];
 
                 peers_mutex.lock();
-                Liveness peer_status = peer.status;
-                auto last_heartbeat = peer.last_heartbeat;
+                Liveness peer_status = peers[j].status;
+                auto last_heartbeat = peers[j].last_heartbeat;
                 peers_mutex.unlock();
             
                 // ---- Liveness check ----
@@ -176,7 +175,7 @@ int main(int argc, char* argv[]) {
                 
                     if (elapsed.count() > 10) {
                         peers_mutex.lock();
-                        peer.status = Liveness::Dead;
+                        peers[j].status = Liveness::Dead;
                         peers_mutex.unlock();
 
                         std::cout << "[HB] Peer " << j << " marked DEAD\n";
