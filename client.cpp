@@ -52,12 +52,14 @@ int main(int argc, char* argv[]) {
     dealer.connect(endpoint);
 
     // ---- Initial send ----
-    MessageType type = MessageType::ClientHandshake;
+    MessageType initial_send_type = MessageType::ClientHandshake;
     std::string payload = "";
 
     // Convert enum to byte
-    uint8_t type_byte = static_cast<uint8_t>(type);
-    zmq::message_t type_frame(&type_byte, sizeof(type_byte));  // 1-byte frame
+    uint8_t type_byte = static_cast<uint8_t>(initial_send_type);
+    // zmq::message_t type_frame(&type_byte, sizeof(type_byte));  // 1-byte frame - Replaced with copy instead of pointer passing because it is safer
+    zmq::message_t type_frame(sizeof(type_byte));
+    memcpy(type_frame.data(), &type_byte, sizeof(type_byte));
     zmq::message_t payload_frame(payload.begin(), payload.end());
 
     // Send
@@ -72,10 +74,10 @@ int main(int argc, char* argv[]) {
         dealer.recv(type_frame);
         dealer.recv(payload_frame);
 
-        MessageType type = static_cast<MessageType>(*static_cast<uint8_t*>(type_frame.data()));
+        MessageType initial_receive_type = static_cast<MessageType>(*static_cast<uint8_t*>(type_frame.data()));
         std::string message(static_cast<char*>(payload_frame.data()), payload_frame.size());
 
-        std::cout << "Received: [" << static_cast<int>(type) << "]: " << message << std::endl;
+        std::cout << "Received: [" << static_cast<int>(initial_receive_type) << "]: " << message << std::endl;
     }
 
     // ---- Interactive loop ----
@@ -90,11 +92,13 @@ int main(int argc, char* argv[]) {
             continue;
 
         // Send 2 frames
-        MessageType type = MessageType::ClientCommand;
+        MessageType send_type = MessageType::ClientCommand;
 
         // Convert enum to byte
-        uint8_t type_byte = static_cast<uint8_t>(type);
-        zmq::message_t type_frame(&type_byte, sizeof(type_byte));  // 1-byte frame
+        uint8_t type_byte = static_cast<uint8_t>(send_type);
+        // zmq::message_t type_frame(&type_byte, sizeof(type_byte));  // 1-byte frame - Replaced with copy instead of pointer passing because it is safer
+        zmq::message_t type_frame(sizeof(type_byte));
+        memcpy(type_frame.data(), &type_byte, sizeof(type_byte));
         zmq::message_t payload_frame(input.begin(), input.end());
 
         // Send
@@ -108,10 +112,10 @@ int main(int argc, char* argv[]) {
         dealer.recv(type_frame_response);
         dealer.recv(payload_frame_response);
 
-        MessageType type = static_cast<MessageType>(*static_cast<uint8_t*>(type_frame_response.data()));
+        MessageType receive_type = static_cast<MessageType>(*static_cast<uint8_t*>(type_frame_response.data()));
         std::string message(static_cast<char*>(payload_frame_response.data()), payload_frame_response.size());
 
-        std::cout << "Received: [" << static_cast<int>(type) << "]: " << message << std::endl;
+        std::cout << "Received: [" << static_cast<int>(receive_type) << "]: " << message << std::endl;
     }
 
     return 0;
