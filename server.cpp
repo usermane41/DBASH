@@ -9,6 +9,7 @@
 #include <chrono>
 #include <memory>
 #include <thread>
+#include <mutex>
 
 enum class Liveness : uint8_t {
     Alive = 1,
@@ -35,6 +36,85 @@ std::string getLoadAverage() {
     iss >> firstNumber;  // extract the first number
 
     return firstNumber;
+}
+
+// Thread qui envoie notre heartbeat à tous les peers alive, toutes les 3 secondes.
+// Il doit également checker qu'aucun pair n'est alive avec une date de dernier heartbeat supérieure à 10 secondes.
+// Sinon, le pair en question doit être switché à l'état dead.
+// NB: les sockets ZeroMQ ne sont pas thread safe.
+void heartbeat_thread(
+    int node_id,
+    int num_nodes,
+    std::vector<PeerInfo>& peers,
+    const std::vector<std::string>& addresses,
+    zmq::context_t& context,
+    std::mutex& peers_mutex
+) {
+    // ---- Create DEALER sockets ----
+    std::vector<zmq::socket_t> dealers(num_nodes);
+
+    for (int j = 0; j < num_nodes; ++j) {
+        if (j == node_id) continue;
+    
+        dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
+    
+        // identity = "heartbeat_" + j
+        std::string identity = "heartbeat_" + std::to_string(j);
+        dealers[j].set(zmq::sockopt::routing_id, identity);
+    
+        // linger = 0
+        dealers[j].set(zmq::sockopt::linger, 0);
+    
+        dealers[j].connect(addresses[j]);
+    
+        std::cout << "[HB] Connected to peer " << j << std::endl;
+    }
+
+    // ---- Loop forever ----
+    while (true) {
+        auto now = std::chrono::steady_clock::now();
+        std::string payload = getLoadAverage();
+    
+        for (int j = 0; j < num_nodes; ++j) {
+            if (j == node_id) continue;
+
+            peers_mutex.lock();
+            Liveness peer_status = peers[j].status;
+            auto last_heartbeat = peers[j].last_heartbeat;
+            peers_mutex.unlock();
+        
+            // ---- Liveness check ----
+            if (peer_status == Liveness::Alive) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_heartbeat
+                );
+            
+                if (elapsed.count() > 10) {
+                    peers_mutex.lock();
+                    peers[j].status = Liveness::Dead;
+                    peers_mutex.unlock();
+
+                    std::cout << "[HB] Peer " << j << " marked DEAD\n";
+                    continue;
+                }
+
+                // ---- Send heartbeat ----
+                MessageType type = MessageType::Heartbeat;
+                uint8_t type_byte = static_cast<uint8_t>(type);
+                zmq::message_t type_frame(sizeof(uint8_t));  // 1-byte frame
+                memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
+                zmq::message_t payload_frame(payload.begin(), payload.end());
+                
+                // Send
+                dealers[j].send(type_frame, zmq::send_flags::sndmore);
+                dealers[j].send(payload_frame, zmq::send_flags::none);
+
+                std::cout << "[HB] Sent to peer " << j << std::endl;
+            }
+        }
+    
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -122,85 +202,7 @@ int main(int argc, char* argv[]) {
         std::cout << "Connected DEALER to node " << j << " and sent load : " << payload << std::endl;
     }
 
-    // Thread qui envoie notre heartbeat à tous les peers alive, toutes les 3 secondes.
-    // Il doit également checker qu'aucun pair n'est alive avec une date de dernier heartbeat supérieure à 10 secondes.
-    // Sinon, le pair en question doit être switché à l'état dead.
-    // NB: les sockets ZeroMQ ne sont pas thread safe.
-    void heartbeat_thread(
-        int node_id,
-        int num_nodes,
-        std::vector<PeerInfo>& peers,
-        const std::vector<std::string>& addresses,
-        zmq::context_t& context,
-        std::mutex& peers_mutex
-    ) {
-        // ---- Create DEALER sockets ----
-        std::vector<zmq::socket_t> dealers(num_nodes);
-
-        for (int j = 0; j < num_nodes; ++j) {
-            if (j == node_id) continue;
-        
-            dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
-        
-            // identity = "heartbeat_" + j
-            std::string identity = "heartbeat_" + std::to_string(j);
-            dealers[j].set(zmq::sockopt::routing_id, identity);
-        
-            // linger = 0
-            dealers[j].set(zmq::sockopt::linger, 0);
-        
-            dealers[j].connect(addresses[j]);
-        
-            std::cout << "[HB] Connected to peer " << j << std::endl;
-        }
-    
-        // ---- Loop forever ----
-        while (true) {
-            auto now = std::chrono::steady_clock::now();
-            std::string payload = getLoadAverage();
-        
-            for (int j = 0; j < num_nodes; ++j) {
-                if (j == node_id) continue;
-
-                peers_mutex.lock();
-                Liveness peer_status = peers[j].status;
-                auto last_heartbeat = peers[j].last_heartbeat;
-                peers_mutex.unlock();
-            
-                // ---- Liveness check ----
-                if (peer_status == Liveness::Alive) {
-                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                        now - last_heartbeat
-                    );
-                
-                    if (elapsed.count() > 10) {
-                        peers_mutex.lock();
-                        peers[j].status = Liveness::Dead;
-                        peers_mutex.unlock();
-
-                        std::cout << "[HB] Peer " << j << " marked DEAD\n";
-                        continue;
-                    }
-
-                    // ---- Send heartbeat ----
-                    MessageType type = MessageType::Heartbeat;
-                    uint8_t type_byte = static_cast<uint8_t>(type);
-                    zmq::message_t type_frame(sizeof(uint8_t));  // 1-byte frame
-                    memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
-                    zmq::message_t payload_frame(payload.begin(), payload.end());
-                    
-                    // Send
-                    dealers[j].send(type_frame, zmq::send_flags::sndmore);
-                    dealers[j].send(payload_frame, zmq::send_flags::none);
-
-                    std::cout << "[HB] Sent to peer " << j << std::endl;
-                }
-            }
-        
-            std::this_thread::sleep_for(std::chrono::seconds(3));
-        }
-    }
-
+    // NB: Il faudrait arrêter le thread probablement dans la version finale. Pour le prototype, c'est suffisant de l'arrêter brutalement.
     std::thread hb_thread(
         heartbeat_thread,
         node_id,
