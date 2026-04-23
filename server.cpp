@@ -58,8 +58,8 @@ void heartbeat_thread(
     
         dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
     
-        // identity = "heartbeat_" + j
-        std::string identity = "heartbeat_" + std::to_string(j);
+        // identity = "heartbeat_" + node_id
+        std::string identity = "heartbeat_" + std::to_string(node_id);
         dealers[j].set(zmq::sockopt::routing_id, identity);
     
         // linger = 0
@@ -94,7 +94,7 @@ void heartbeat_thread(
                     peers[j].status = Liveness::Dead;
                     peers_mutex.unlock();
 
-                    std::cout << "[HB] Peer " << j << " marked DEAD\n";
+                    std::cout << "[HB] Peer " << j << " marked DEAD" << std::endl;
                     continue;
                 }
 
@@ -231,7 +231,7 @@ int main(int argc, char* argv[]) {
 
         switch(type) {
             case MessageType::Heartbeat: {
-                int indice = std::stoi(sender_id.substr(10));
+                int indice = sender_id.starts_with("heartbeat_") ? std::stoi(sender_id.substr(10)) : std::stoi(sender_id);
 
                 peers_mutex.lock();
                 Liveness peer_status = peers[indice].status;

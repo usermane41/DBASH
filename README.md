@@ -14,7 +14,7 @@ sudo apt install -y libzmq3-dev
 # Compiling
 
 ```
-g++ -std=c++20 server.cpp -o server -lzmq -pthread
+g++ -std=c++20 server.cpp -o server -lzmq -pthread -Wno-unused-result
 ```
 
 # Launching the program
