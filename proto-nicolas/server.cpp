@@ -22,13 +22,14 @@ std::vector<PeerInfo> peers;
 std::mutex peers_mutex;
 int my_node_id;
 int num_nodes;
+std::string connected_client_id = "";//servira a stocker le sender_id pour stocker l'id du client
 
 // Foreground redirections en attente : target_node_id -> client_sender_id
 std::map<int, std::string> pending_redirections;
 
 // Background redirections en attente : target_node_id -> client_sender_id
 // Effacé seulement quand RemoteJobFinished arrive (pas à RemoteReturnValue)
-std::map<int, std::string> pending_bg_redirections;
+std::multimap<int, std::string> pending_bg_redirections;
 
 // Background jobs locaux : local_pid -> {global_pid, client_sender_id, is_remote}
 // is_remote = true si le job vient d'un RemoteCommand
@@ -62,6 +63,8 @@ void heartbeat_thread(const std::vector<std::string>& addresses, zmq::context_t&
         dealers[j].connect(addresses[j]);
         std::cout << "[HB] Connected to peer " << j << std::endl;
     }
+    zmq::socket_t notif_dead(context, zmq::socket_type::pair);
+    notif_dead.connect("inproc://nodedead");
     while (true) {
         auto now = std::chrono::steady_clock::now();
         std::string payload = getLoadAverage();
@@ -78,6 +81,10 @@ void heartbeat_thread(const std::vector<std::string>& addresses, zmq::context_t&
                     peers[j].status = Liveness::Dead;
                     peers_mutex.unlock();
                     std::cout << "[HB] Peer " << j << " marked DEAD" << std::endl;
+                    // Notifier le receive loop
+                    std::string msg = std::to_string(j);
+                    zmq::message_t m(msg.begin(), msg.end());
+                    notif_dead.send(m, zmq::send_flags::none);
                     continue;
                 }
             }
@@ -243,6 +250,10 @@ int main(int argc, char* argv[]) {
     zmq::socket_t pair_pull(context, zmq::socket_type::pair);
     pair_pull.bind("inproc://jobdone");
 
+    zmq::socket_t pair_nodedead(context, zmq::socket_type::pair);
+    pair_nodedead.bind("inproc://nodedead");
+
+
     peers.resize(num_nodes);
     for (int j = 0; j < num_nodes; ++j) {
         if (j == my_node_id) continue;
@@ -266,10 +277,11 @@ int main(int argc, char* argv[]) {
 
     while (true) {
         zmq::pollitem_t items[] = {
-            { static_cast<void*>(router),    0, ZMQ_POLLIN, 0 },
-            { static_cast<void*>(pair_pull), 0, ZMQ_POLLIN, 0 }
+            { static_cast<void*>(router),         0, ZMQ_POLLIN, 0 },
+            { static_cast<void*>(pair_pull),      0, ZMQ_POLLIN, 0 },
+            { static_cast<void*>(pair_nodedead),  0, ZMQ_POLLIN, 0 }
         };
-        zmq::poll(items, 2, -1);
+        zmq::poll(items, 3, -1);
 
         // ---- Watchdog : job background terminé ----
         if (items[1].revents & ZMQ_POLLIN) {
@@ -310,6 +322,25 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // ---- NodeDead : pair passe Dead ----
+        if (items[2].revents & ZMQ_POLLIN) {
+            zmq::message_t notif;
+            pair_nodedead.recv(notif);
+            std::string dead_node_str(static_cast<char*>(notif.data()), notif.size());
+
+            if (!connected_client_id.empty()) {
+                uint8_t resp_byte = static_cast<uint8_t>(MessageType::NodeDead);
+                zmq::message_t resp_type_frame(sizeof(uint8_t));
+                memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                zmq::message_t resp_payload_frame(dead_node_str.begin(), dead_node_str.end());
+                zmq::message_t client_frame(connected_client_id.begin(), connected_client_id.end());
+                router.send(client_frame, zmq::send_flags::sndmore);
+                router.send(resp_type_frame, zmq::send_flags::sndmore);
+                router.send(resp_payload_frame, zmq::send_flags::none);
+                std::cout << "[ND] Node " << dead_node_str << " dead, notified " << connected_client_id << std::endl;
+            }
+        }
+
         // ---- Message réseau ----
         if (items[0].revents & ZMQ_POLLIN) {
             zmq::message_t sender, type_frame, payload_frame;
@@ -344,7 +375,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 case MessageType::ClientCommand: {
-                    float my_load = std::stof(getLoadAverage());//999.0f si on veut tester l'envoi de ma charge sur d'autre machine
+                    float my_load = 999.0f;//std::stof(getLoadAverage());//999.0f si on veut tester l'envoi de ma charge sur d'autre machine
                     peers_mutex.lock();
                     float global_charge = get_global_load(peers);
                     int target = select_target(my_node_id, peers);
@@ -368,7 +399,7 @@ int main(int argc, char* argv[]) {
 
                             if (background) {
                                 // Stocker dans pending_bg_redirections
-                                pending_bg_redirections[target] = sender_id;
+                                pending_bg_redirections.insert({target, sender_id});
                             } else {
                                 pending_redirections[target] = sender_id;
                             }
@@ -480,6 +511,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 case MessageType::ClientHandshake: {
+                    connected_client_id = sender_id;
                     uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientAcknowledgement);
                     zmq::message_t resp_type_frame(sizeof(uint8_t));
                     memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));

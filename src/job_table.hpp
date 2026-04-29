@@ -15,6 +15,7 @@ struct Job{
     std::string command;//savoir quelle cmd a été lancer
     bool background;//si lancer avec &
     bool finished;//savoir si le job est fini ou pas
+    bool failed = false;//savoir si le job a echouer ou pas
 };
 
 extern std::vector<Job> job_table;//la liste de tout les job

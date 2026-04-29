@@ -20,9 +20,6 @@ static constexpr const char* PROMPT = "dbash> ";
 static zmq::context_t zmq_ctx{1};
 static zmq::socket_t  zmq_dealer{zmq_ctx, zmq::socket_type::dealer};
 
-/* ---------- forward declaration ---------- */
-static void execute_command(const Command& cmd);
-
 /* ---------- helpers ZeroMQ ---------- */
 
 static void zmq_send(MessageType type, const std::string& payload)
@@ -50,8 +47,7 @@ static std::pair<MessageType, std::string> zmq_recv()
     return {type, payload};
 }
 
-/* ---------- handlers asynchrones ---------- */
-
+// Traite un JobFinished
 static void handle_job_finished(const std::string& payload)
 {
     uint32_t gpid = std::stoul(payload.substr(11));
@@ -65,35 +61,36 @@ static void handle_job_finished(const std::string& payload)
     }
 }
 
-static void handle_node_dead(int dead_node)
-{
+static void handle_node_dead(int dead_node){
     std::vector<std::string> relancer;
     {
         std::lock_guard<std::mutex> lock(job_mutex);
-        for (Job& j : job_table) {
-            if (j.node_id == dead_node && !j.finished) {
-                j.finished = true;
-                j.failed   = true;
-                relancer.push_back(j.command + " &");
+        for(Job& j: job_table){
+            if(j.node_id==dead_node && !j.finished){
+                j.finished=true;
+                j.failed=true;
+                relancer.push_back(j.command);
             }
         }
     }
-    for (const std::string& cmd_str : relancer) {
-        Command cmd = parse_line(cmd_str);
+    for(const std::string& cmd_str : relancer){
+        Command cmd= parse_line(cmd_str);
         execute_command(cmd);
     }
 }
 
-/* ---------- check notifications ---------- */
-
+// Vérifie si le serveur a envoyé des notifications JobFinished en attente
 static void check_job_notifications()
 {
     zmq::pollitem_t items[] = {
         { static_cast<void*>(zmq_dealer), 0, ZMQ_POLLIN, 0 }
     };
+    std::cout << "[DEBUG check] polling...\n";
     int rc = zmq::poll(items, 1, std::chrono::milliseconds(10));
+    std::cout << "[DEBUG check] poll returned: " << rc << "\n";
     while (rc > 0 && (items[0].revents & ZMQ_POLLIN)) {
         auto [type, payload] = zmq_recv();
+        std::cout << "[DEBUG check] got message type: " << static_cast<int>(type) << "\n";
         if (type == MessageType::JobFinished) {
             handle_job_finished(payload);
         } else if (type == MessageType::NodeDead) {
@@ -115,10 +112,10 @@ static void builtin_ps()
 {
     check_job_notifications();
     std::lock_guard<std::mutex> lock(job_mutex);
-    std::cout << "global_pid   node   command   status   failed\n";
+    std::cout << "global_pid   node   command   status\n";
     for (Job& j : job_table) {
         std::cout << j.global_pid << "   " << j.node_id << "   "
-                  << j.command   << "   " << j.finished << "   " << j.failed << "\n";
+                  << j.command   << "   " << j.finished << "\n";
     }
 }
 
@@ -172,6 +169,7 @@ static bool handle_builtin(const Command& cmd)
     return false;
 }
 
+
 /* ---------- execute ---------- */
 
 static void execute_command(const Command& cmd)
@@ -187,7 +185,7 @@ static void execute_command(const Command& cmd)
 
     zmq_send(MessageType::ClientCommand, command_str);
 
-    // Recevoir la réponse — peut recevoir des JobFinished ou NodeDead en chemin
+    // Recevoir la réponse — peut recevoir des JobFinished en chemin
     MessageType type;
     std::string payload;
     while (true) {
@@ -195,9 +193,8 @@ static void execute_command(const Command& cmd)
         if (t == MessageType::JobFinished) {
             handle_job_finished(p);
             continue;
-        } else if (t == MessageType::NodeDead) {
+        }else if(t==MessageType::NodeDead){
             handle_node_dead(std::stoi(p));
-            continue;
         }
         type = t;
         payload = p;
@@ -216,10 +213,9 @@ static void execute_command(const Command& cmd)
             j.local_pid  = gpid & 0xFFFF;
             j.global_pid = gpid;
             j.node_id    = gpid >> 16;
-            j.command    = cmd.background ? command_str.substr(0, command_str.size() - 2) : command_str;  // enlever " &";
+            j.command    = cmd.name();
             j.background = cmd.background;
             j.finished   = !cmd.background;
-            j.failed     = false;
             add_job(j);
 
             if (!output.empty()) std::cout << output;
