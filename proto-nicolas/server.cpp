@@ -38,6 +38,7 @@ struct BgJob {
     uint32_t global_pid;
     std::string sender_id;  // client_id si local, node_id si remote
     bool is_remote;
+    int pipe_read_fd;
 };
 std::map<pid_t, BgJob> background_jobs;
 
@@ -122,9 +123,19 @@ void watchdog_thread(zmq::context_t& context) {
         background_jobs.erase(it);
         bg_mutex.unlock();
 
+        // Lire l'output depuis le pipe
+        std::string output;
+        char buf[4096];
+        ssize_t n;
+        while ((n = read(job.pipe_read_fd, buf, sizeof(buf))) > 0)
+            output.append(buf, n);
+        close(job.pipe_read_fd);
+
+        // Format : "global_pid|sender_id|is_remote|output"
         std::string msg = std::to_string(job.global_pid) + "|"
                         + job.sender_id + "|"
-                        + (job.is_remote ? "1" : "0");
+                        + (job.is_remote ? "1" : "0") + "|"
+                        + output;
         zmq::message_t m(msg.begin(), msg.end());
         notif.send(m, zmq::send_flags::none);
     }
@@ -202,10 +213,12 @@ static std::pair<uint32_t, std::string> fork_and_exec(
         waitpid(pid, nullptr, 0);
     } else {
         bg_mutex.lock();
-        background_jobs[pid] = {global_pid, sender_id, is_remote};
+        background_jobs[pid] = {global_pid, sender_id, is_remote, pipefd[0]};  // ← ajouter pipefd[0]
         bg_mutex.unlock();
+        // NE PAS close(pipefd[0]) ici — le watchdog va le lire
+        return {global_pid, ""};
     }
-    close(pipefd[0]);
+    close(pipefd[0]);  // seulement pour le foreground
 
     return {global_pid, output};
 }
@@ -289,14 +302,16 @@ int main(int argc, char* argv[]) {
             pair_pull.recv(notif);
             std::string msg(static_cast<char*>(notif.data()), notif.size());
 
-            // Format : "global_pid|sender_id|is_remote"
+            // Format : "global_pid|sender_id|is_remote|output"
             size_t sep1 = msg.find('|');
             size_t sep2 = msg.find('|', sep1 + 1);
+            size_t sep3 = msg.find('|', sep2 + 1);
             uint32_t global_pid = std::stoul(msg.substr(0, sep1));
             std::string sender_id = msg.substr(sep1 + 1, sep2 - sep1 - 1);
-            bool is_remote = msg.substr(sep2 + 1) == "1";
+            bool is_remote = msg.substr(sep2 + 1, sep3 - sep2 - 1) == "1";
+            std::string output = msg.substr(sep3 + 1);
 
-            std::string gpid_payload = "global_pid:" + std::to_string(global_pid);
+            std::string gpid_payload = "global_pid:" + std::to_string(global_pid) + "\n" + output;
 
             if (!is_remote) {
                 // Job local — notifier directement le client
@@ -375,7 +390,7 @@ int main(int argc, char* argv[]) {
                 }
 
                 case MessageType::ClientCommand: {
-                    float my_load = 999.0f;//std::stof(getLoadAverage());//999.0f si on veut tester l'envoi de ma charge sur d'autre machine
+                    float my_load = std::stof(getLoadAverage());//999.0f si on veut tester l'envoi de ma charge sur d'autre machine
                     peers_mutex.lock();
                     float global_charge = get_global_load(peers);
                     int target = select_target(my_node_id, peers);

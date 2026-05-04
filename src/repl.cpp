@@ -54,12 +54,16 @@ static std::pair<MessageType, std::string> zmq_recv()
 
 static void handle_job_finished(const std::string& payload)
 {
-    uint32_t gpid = std::stoul(payload.substr(11));
+    uint32_t gpid = std::stoul(payload.substr(11, payload.find('\n') - 11));
+    std::string output = payload.find('\n') != std::string::npos 
+        ? payload.substr(payload.find('\n') + 1) : "";
+    
     std::lock_guard<std::mutex> lock(job_mutex);
     for (Job& j : job_table) {
         if (j.global_pid == gpid) {
             j.finished = true;
             std::cout << "\n[done] " << j.command << " (pid " << gpid << ")\n";
+            if (!output.empty()) std::cout << output;
             break;
         }
     }
