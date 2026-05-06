@@ -1,0 +1,20 @@
+# Créer les répertoires de travail
+mkdir /tmp/node0 /tmp/node1 /tmp/node2 /tmp/node3
+
+# Créer un fichier test dans node1
+echo "fichier_node1" > /tmp/node1/test.txt
+
+# Copier le config dans chaque répertoire
+cp ~/Bureau/DBASH/config_servers.txt /tmp/node0/
+cp ~/Bureau/DBASH/config_servers.txt /tmp/node1/
+cp ~/Bureau/DBASH/config_servers.txt /tmp/node2/
+cp ~/Bureau/DBASH/config_servers.txt /tmp/node3/
+
+# Lancer les serveurs depuis leurs répertoires
+cd /tmp/node0 && ~/Bureau/DBASH/server 0
+cd /tmp/node1 && ~/Bureau/DBASH/server 1
+cd /tmp/node2 && ~/Bureau/DBASH/server 2
+cd /tmp/node3 && ~/Bureau/DBASH/server 3
+
+# Lancer le shell
+cd ~/Bureau/DBASH && ./dbash 0

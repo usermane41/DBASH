@@ -89,7 +89,7 @@ static void handle_node_dead(int dead_node)
 }
 
 /* ---------- check notifications ---------- */
-
+//verifie si des notif de  job lancer en & sont arriver ou pas. 
 static void check_job_notifications()
 {
     zmq::pollitem_t items[] = {
