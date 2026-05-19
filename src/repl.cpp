@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <signal.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 #include <fstream>
@@ -19,6 +20,11 @@ static constexpr const char* PROMPT = "dbash> ";
 
 static zmq::context_t zmq_ctx{1};
 static zmq::socket_t  zmq_dealer{zmq_ctx, zmq::socket_type::dealer};
+
+// gpid du job foreground actuellement en attente de réponse.
+// 0 si aucun job foreground en cours.
+// Écrit par execute_command, lu par sigint_handler.
+static volatile uint32_t current_fg_gpid = 0;
 
 /* ---------- forward declaration ---------- */
 static void execute_command(const Command& cmd);
@@ -36,18 +42,41 @@ static void zmq_send(MessageType type, const std::string& payload)
 
 static std::pair<MessageType, std::string> zmq_recv()
 {
-    zmq::message_t type_frame;
-    zmq::message_t payload_frame;
-    zmq_dealer.recv(type_frame);
-    zmq_dealer.recv(payload_frame);
-    MessageType type = static_cast<MessageType>(
-        *static_cast<uint8_t*>(type_frame.data())
-    );
-    std::string payload(
-        static_cast<char*>(payload_frame.data()),
-        payload_frame.size()
-    );
-    return {type, payload};
+    while (true) {
+        try {
+            zmq::message_t type_frame;
+            zmq::message_t payload_frame;
+            zmq_dealer.recv(type_frame);
+            zmq_dealer.recv(payload_frame);
+            MessageType type = static_cast<MessageType>(
+                *static_cast<uint8_t*>(type_frame.data())
+            );
+            std::string payload(
+                static_cast<char*>(payload_frame.data()),
+                payload_frame.size()
+            );
+            return {type, payload};
+        } catch (const zmq::error_t& e) {
+            if (e.num() == EINTR) {
+                continue;
+            }
+            throw;
+        }
+    }
+}
+
+/* ---------- SIGINT handler ---------- */
+
+static void sigint_handler(int)
+{
+    if (current_fg_gpid > 1) {
+        // On a le vrai gpid — envoyer le kill directement
+        std::string payload = std::to_string(current_fg_gpid >> 16) + ":2:"
+                            + std::to_string(current_fg_gpid & 0xFFFF);
+        zmq_send(MessageType::RemoteKill, payload);
+    }
+    // Si current_fg_gpid == 1 (sentinelle) ou 0 : on ne fait rien,
+    // on attend que ClientPid arrive pour avoir le vrai gpid
 }
 
 /* ---------- handlers asynchrones ---------- */
@@ -89,7 +118,7 @@ static void handle_node_dead(int dead_node)
 }
 
 /* ---------- check notifications ---------- */
-//verifie si des notif de  job lancer en & sont arriver ou pas. 
+
 static void check_job_notifications()
 {
     zmq::pollitem_t items[] = {
@@ -121,8 +150,10 @@ static void builtin_ps()
     std::lock_guard<std::mutex> lock(job_mutex);
     std::cout << "global_pid   node   command   status   failed\n";
     for (Job& j : job_table) {
-        std::cout << j.global_pid << "   " << j.node_id << "   "
-                  << j.command   << "   " << j.finished << "   " << j.failed << "\n";
+        if (!j.finished) {
+            std::cout << j.global_pid << "   " << j.node_id << "   "
+                      << j.command   << "   " << j.finished << "   " << j.failed << "\n";
+        }
     }
 }
 
@@ -191,15 +222,25 @@ static void execute_command(const Command& cmd)
 
     zmq_send(MessageType::ClientCommand, command_str);
 
-    // Recevoir la réponse — peut recevoir des JobFinished ou NodeDead en chemin
+    if (!cmd.background) {
+        current_fg_gpid = 1;  // sentinelle : fg job en attente, vrai gpid pas encore connu
+    }
+
     MessageType type;
     std::string payload;
     while (true) {
         auto [t, p] = zmq_recv();
+        if (t == MessageType::ClientPid) {
+            // Vrai gpid reçu juste après le fork côté serveur
+            // Si Ctrl+C était arrivé pendant la sentinelle, on envoie le kill maintenant
+            current_fg_gpid = std::stoul(p);
+            continue;
+        }
         if (t == MessageType::JobFinished) {
             handle_job_finished(p);
             continue;
-        } else if (t == MessageType::NodeDead) {
+        }
+        if (t == MessageType::NodeDead) {
             handle_node_dead(std::stoi(p));
             continue;
         }
@@ -220,7 +261,7 @@ static void execute_command(const Command& cmd)
             j.local_pid  = gpid & 0xFFFF;
             j.global_pid = gpid;
             j.node_id    = gpid >> 16;
-            j.command    = cmd.background ? command_str.substr(0, command_str.size() - 2) : command_str;  // enlever " &";
+            j.command    = cmd.background ? command_str.substr(0, command_str.size() - 2) : command_str;
             j.background = cmd.background;
             j.finished   = !cmd.background;
             j.failed     = false;
@@ -230,6 +271,10 @@ static void execute_command(const Command& cmd)
         } else {
             std::cout << payload;
         }
+    }
+
+    if (!cmd.background) {
+        current_fg_gpid = 0;
     }
 
     check_job_notifications();
@@ -253,7 +298,7 @@ void repl_run(int node_id)
         exit(1);
     }
 
-    std::string identity = "client_" + std::to_string(node_id);
+    std::string identity = "client_" + std::to_string(getpid());
     zmq_dealer.set(zmq::sockopt::routing_id, identity);
     zmq_dealer.set(zmq::sockopt::linger, 0);
     zmq_dealer.connect(endpoints[node_id]);
@@ -264,6 +309,12 @@ void repl_run(int node_id)
         std::cerr << "Handshake failed\n";
         exit(1);
     }
+
+    struct sigaction sa{};
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
 
     char* raw;
     while ((raw = readline(PROMPT)) != nullptr) {

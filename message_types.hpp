@@ -13,5 +13,6 @@ enum class MessageType : uint8_t {
     RemoteKill            = 8,
     JobFinished           = 9,
     RemoteJobFinished     = 10,
-    NodeDead              = 11
+    NodeDead              = 11,
+    ClientPid             = 12
 };

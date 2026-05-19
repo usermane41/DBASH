@@ -11,72 +11,39 @@
 #include <memory>
 #include <thread>
 #include <mutex>
+#include <functional>
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <load_balancer.hpp>
 #include <random>
 #include <map>
+#include <set>
 
-// peers : infos sur chaque noeud (charge, status, socket dealer vers ce noeud)
-// peers_mutex : accès concurrent entre heartbeat_thread et receive loop
 std::vector<PeerInfo> peers;
 std::mutex peers_mutex;
 int my_node_id;
 int num_nodes;
 
-// Identité ZeroMQ du client connecté — stockée au handshake
-// pour pouvoir lui envoyer des notifications asynchrones (JobFinished, NodeDead)
-std::string connected_client_id = "";
+std::set<std::string> connected_clients;
 
-// Table des processus background en cours d'exécution sur ce noeud
-// Clé : PID Unix local — Valeur : infos pour notifier quand le processus se termine
+std::map<int, std::string> pending_redirections;
+std::multimap<int, std::string> pending_bg_redirections;
+
 std::mutex bg_mutex;
 struct BgJob {
-    uint32_t global_pid;    // PID unique sur le cluster : (node_id << 16) | local_pid
-    std::string sender_id;  // "client_0" si lancé localement, "0" si RemoteCommand
-    bool is_remote;         // true si la commande vient d'un autre noeud
-    int pipe_read_fd;       // fd de lecture du pipe pour récupérer l'output
+    uint32_t global_pid;
+    std::string sender_id;  // client_id si local, node_id si remote
+    bool is_remote;
+    bool is_foreground;     // true = job fg, watchdog envoie ClientReturnValue
+                            // false = job bg, watchdog envoie JobFinished
+    int pipe_read_fd;
 };
 std::map<pid_t, BgJob> background_jobs;
 
-// ---- Helpers ZeroMQ ----
-
-// Envoyer via le ROUTER vers une identité précise (client ou noeud)
-// Format : [identity | type | payload]
-static void router_send(zmq::socket_t& router, const std::string& identity,
-                         MessageType type, const std::string& payload)
-{
-    uint8_t type_byte = static_cast<uint8_t>(type);
-    zmq::message_t id_frame(identity.begin(), identity.end());
-    zmq::message_t type_frame(sizeof(uint8_t));
-    memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
-    zmq::message_t payload_frame(payload.begin(), payload.end());
-    router.send(id_frame, zmq::send_flags::sndmore);
-    router.send(type_frame, zmq::send_flags::sndmore);
-    router.send(payload_frame, zmq::send_flags::none);
-}
-
-// Envoyer via un DEALER vers un autre noeud
-// Format : [type | payload]
-static void dealer_send(zmq::socket_t& dealer, MessageType type, const std::string& payload)
-{
-    uint8_t type_byte = static_cast<uint8_t>(type);
-    zmq::message_t type_frame(sizeof(uint8_t));
-    memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
-    zmq::message_t payload_frame(payload.begin(), payload.end());
-    dealer.send(type_frame, zmq::send_flags::sndmore);
-    dealer.send(payload_frame, zmq::send_flags::none);
-}
-
-// ---- Utilitaires ----
-
-// Lit /proc/loadavg et retourne le premier nombre (moyenne sur 1 minute)
 std::string getLoadAverage() {
     std::ifstream load_file("/proc/loadavg");
-    if (!load_file.is_open()) {
-        return "0.0";
-    }
+    if (!load_file.is_open()) return "0.0";
     std::string line;
     std::getline(load_file, line);
     std::istringstream iss(line);
@@ -85,51 +52,10 @@ std::string getLoadAverage() {
     return firstNumber;
 }
 
-// Broadcast immédiat de notre charge à tous les pairs alive
-// Appelé après chaque fork pour que les autres noeuds mettent à jour
-// leur vue sans attendre le prochain heartbeat périodique (3s)
-static void broadcast_load() {
-    std::string new_load = getLoadAverage();
-    for (int j = 0; j < num_nodes; ++j) {
-        if (j == my_node_id) {
-            continue;
-        }
-        peers_mutex.lock();
-        Liveness st = peers[j].status;
-        peers_mutex.unlock();
-        if (st != Liveness::Alive) {
-            continue;
-        }
-        dealer_send(*peers[j].dealer, MessageType::Heartbeat, new_load);
-    }
-}
-
-// Parse "cmd arg1 arg2 [&]" en vecteur de tokens — le & est ignoré ici
-static std::vector<std::string> split_command(const std::string& cmd_str) {
-    std::vector<std::string> tokens;
-    std::istringstream iss(cmd_str);
-    std::string token;
-    while (iss >> token) {
-        if (token == "&") {
-            break;
-        }
-        tokens.push_back(token);
-    }
-    return tokens;
-}
-
-// ---- Threads ----
-
-// Thread heartbeat : toutes les 3s, envoie notre charge à tous les pairs
-// Détecte les pairs morts (>10s sans heartbeat) et notifie le receive loop
-// via socket PAIR inproc://nodedead (ZeroMQ n'est pas thread-safe,
-// on ne peut pas envoyer directement sur le router depuis ce thread)
 void heartbeat_thread(const std::vector<std::string>& addresses, zmq::context_t& context) {
     std::vector<zmq::socket_t> dealers(num_nodes);
     for (int j = 0; j < num_nodes; ++j) {
-        if (j == my_node_id) {
-            continue;
-        }
+        if (j == my_node_id) continue;
         dealers[j] = zmq::socket_t(context, zmq::socket_type::dealer);
         std::string identity = "heartbeat_" + std::to_string(my_node_id);
         dealers[j].set(zmq::sockopt::routing_id, identity);
@@ -137,23 +63,17 @@ void heartbeat_thread(const std::vector<std::string>& addresses, zmq::context_t&
         dealers[j].connect(addresses[j]);
         std::cout << "[HB] Connected to peer " << j << std::endl;
     }
-
     zmq::socket_t notif_dead(context, zmq::socket_type::pair);
     notif_dead.connect("inproc://nodedead");
-
     while (true) {
         auto now = std::chrono::steady_clock::now();
         std::string payload = getLoadAverage();
-
         for (int j = 0; j < num_nodes; ++j) {
-            if (j == my_node_id) {
-                continue;
-            }
+            if (j == my_node_id) continue;
             peers_mutex.lock();
             Liveness peer_status = peers[j].status;
             auto last_heartbeat = peers[j].last_heartbeat;
             peers_mutex.unlock();
-
             if (peer_status == Liveness::Alive) {
                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_heartbeat);
                 if (elapsed.count() > 10) {
@@ -161,16 +81,19 @@ void heartbeat_thread(const std::vector<std::string>& addresses, zmq::context_t&
                     peers[j].status = Liveness::Dead;
                     peers_mutex.unlock();
                     std::cout << "[HB] Peer " << j << " marked DEAD" << std::endl;
-                    // Notifier le receive loop via socket interne
                     std::string msg = std::to_string(j);
                     zmq::message_t m(msg.begin(), msg.end());
                     notif_dead.send(m, zmq::send_flags::none);
                     continue;
                 }
             }
-
             if (peer_status == Liveness::Alive || peer_status == Liveness::Uninitialized) {
-                dealer_send(dealers[j], MessageType::Heartbeat, payload);
+                uint8_t type_byte = static_cast<uint8_t>(MessageType::Heartbeat);
+                zmq::message_t type_frame(sizeof(uint8_t));
+                memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
+                zmq::message_t payload_frame(payload.begin(), payload.end());
+                dealers[j].send(type_frame, zmq::send_flags::sndmore);
+                dealers[j].send(payload_frame, zmq::send_flags::none);
                 std::cout << "[HB] Sent to peer " << j << std::endl;
             }
         }
@@ -178,10 +101,8 @@ void heartbeat_thread(const std::vector<std::string>& addresses, zmq::context_t&
     }
 }
 
-// Thread watchdog : attend tous les processus background via waitpid(-1)
-// Quand un processus se termine, lit son output et notifie le receive loop
-// via socket PAIR inproc://jobdone
-// Format notification : "global_pid|sender_id|is_remote|output"
+// Format notification watchdog → receive loop :
+// "global_pid|sender_id|is_remote|is_foreground|output"
 void watchdog_thread(zmq::context_t& context) {
     zmq::socket_t notif(context, zmq::socket_type::pair);
     notif.connect("inproc://jobdone");
@@ -189,9 +110,7 @@ void watchdog_thread(zmq::context_t& context) {
     while (true) {
         int status;
         pid_t pid = waitpid(-1, &status, 0);
-        if (pid <= 0) {
-            continue;
-        }
+        if (pid <= 0) continue;
 
         bg_mutex.lock();
         auto it = background_jobs.find(pid);
@@ -203,111 +122,116 @@ void watchdog_thread(zmq::context_t& context) {
         background_jobs.erase(it);
         bg_mutex.unlock();
 
-        // Lire l'output accumulé dans le pipe
         std::string output;
         char buf[4096];
         ssize_t n;
-        while ((n = read(job.pipe_read_fd, buf, sizeof(buf))) > 0) {
+        while ((n = read(job.pipe_read_fd, buf, sizeof(buf))) > 0)
             output.append(buf, n);
-        }
         close(job.pipe_read_fd);
 
+        // Ajouter is_foreground dans le message
         std::string msg = std::to_string(job.global_pid) + "|"
                         + job.sender_id + "|"
                         + (job.is_remote ? "1" : "0") + "|"
+                        + (job.is_foreground ? "1" : "0") + "|"
                         + output;
         zmq::message_t m(msg.begin(), msg.end());
         notif.send(m, zmq::send_flags::none);
     }
 }
 
-// ---- Fork/exec ----
+static void broadcast_load() {
+    std::string new_load = getLoadAverage();
+    for (int j = 0; j < num_nodes; ++j) {
+        if (j == my_node_id) continue;
+        peers_mutex.lock();
+        Liveness st = peers[j].status;
+        peers_mutex.unlock();
+        if (st != Liveness::Alive) continue;
+        uint8_t hb_byte = static_cast<uint8_t>(MessageType::Heartbeat);
+        zmq::message_t hb_type_frame(sizeof(uint8_t));
+        memcpy(hb_type_frame.data(), &hb_byte, sizeof(uint8_t));
+        zmq::message_t hb_payload(new_load.begin(), new_load.end());
+        peers[j].dealer->send(hb_type_frame, zmq::send_flags::sndmore);
+        peers[j].dealer->send(hb_payload, zmq::send_flags::none);
+    }
+}
 
-// Fork et exécute une commande. Capture stdout/stderr via pipe.
-// Foreground : bloque sur waitpid, retourne {global_pid, output}
-// Background : enregistre dans background_jobs pour le watchdog, retourne {global_pid, ""}
-static std::pair<uint32_t, std::string> fork_and_exec(
+static std::vector<std::string> split_command(const std::string& cmd_str) {
+    std::vector<std::string> tokens;
+    std::istringstream iss(cmd_str);
+    std::string token;
+    while (iss >> token) {
+        if (token == "&") break;
+        tokens.push_back(token);
+    }
+    return tokens;
+}
+
+// fork_and_exec ne bloque JAMAIS sur le pipe.
+// Foreground et background sont tous les deux enregistrés dans background_jobs.
+// Le watchdog lit le pipe et notifie le receive loop dans les deux cas.
+// is_foreground=true → watchdog envoie ClientReturnValue (réponse synchrone simulée)
+// is_foreground=false → watchdog envoie JobFinished (notification async)
+// on_pid : callback appelé juste après le fork avec le global_pid,
+//          pour envoyer ClientPid au client avant que le process se termine.
+static uint32_t fork_and_exec(
     const std::string& message, bool background,
-    const std::string& sender_id, bool is_remote)
+    const std::string& sender_id, bool is_remote,
+    std::function<void(uint32_t)> on_pid = nullptr)
 {
-    // Enlever le " &" de la string si background
     std::string cmd_str = background ? message.substr(0, message.size() - 2) : message;
     auto tokens = split_command(cmd_str);
-    if (tokens.empty()) {
-        return {0, "error: empty command"};
-    }
+    if (tokens.empty()) return 0;
 
     int pipefd[2];
-    if (pipe(pipefd) < 0) {
-        return {0, "error: pipe failed"};
-    }
+    if (pipe(pipefd) < 0) return 0;
 
     pid_t pid = fork();
     if (pid < 0) {
         close(pipefd[0]);
         close(pipefd[1]);
-        return {0, "error: fork failed"};
+        return 0;
     }
 
     if (pid == 0) {
-        // Enfant : rediriger stdout et stderr vers le pipe
+        setpgid(0, 0);
         close(pipefd[0]);
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
         std::vector<char*> exec_argv;
-        for (auto& t : tokens) {
-            exec_argv.push_back(t.data());
-        }
+        for (auto& t : tokens) exec_argv.push_back(t.data());
         exec_argv.push_back(nullptr);
         execvp(exec_argv[0], exec_argv.data());
         _exit(127);
     }
 
-    // Parent
+    setpgid(pid, pid);
     close(pipefd[1]);
-    // PID global unique : 16 bits node_id | 16 bits local_pid
     uint32_t global_pid = (static_cast<uint32_t>(my_node_id) << 16) | static_cast<uint32_t>(pid);
 
-    // Heartbeat réactif : informer les pairs de notre nouvelle charge immédiatement
     broadcast_load();
 
-    std::string output;
-    if (!background) {
-        // Foreground : lire tout l'output et attendre la fin
-        char buf[4096];
-        ssize_t n;
-        while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
-            output.append(buf, n);
-        }
-        waitpid(pid, nullptr, 0);
-        close(pipefd[0]);
-    } else {
-        // Background : le watchdog lira le pipe après waitpid
-        // Ne pas fermer pipefd[0] ici
-        bg_mutex.lock();
-        background_jobs[pid] = {global_pid, sender_id, is_remote, pipefd[0]};
-        bg_mutex.unlock();
-        return {global_pid, ""};
-    }
+    // Notifier le client du vrai gpid immédiatement après le fork
+    if (on_pid) on_pid(global_pid);
 
-    return {global_pid, output};
+    // Enregistrer dans background_jobs — le watchdog gère la suite
+    // is_foreground=true si c'est un job fg (pas de & dans la commande)
+    bg_mutex.lock();
+    background_jobs[pid] = {global_pid, sender_id, is_remote, !background, pipefd[0]};
+    bg_mutex.unlock();
+
+    return global_pid;
 }
 
-// Construit le payload de réponse
-// Foreground : "global_pid:XXX\n<output>"
-// Background : "global_pid:XXX"
-static std::string build_response(uint32_t global_pid, const std::string& output, bool background) {
-    if (!global_pid) {
-        return "error: fork failed";
-    }
-    if (background) {
-        return "global_pid:" + std::to_string(global_pid);
-    }
-    return "global_pid:" + std::to_string(global_pid) + "\n" + output;
+static std::string build_response(uint32_t global_pid, bool background) {
+    if (!global_pid) return "error: fork failed";
+    if (background) return "global_pid:" + std::to_string(global_pid);
+    // Pour foreground : le watchdog enverra l'output séparément via ClientReturnValue
+    // On retourne juste le global_pid pour que le client puisse l'enregistrer
+    return "global_pid:" + std::to_string(global_pid);
 }
-
-// ---- Main ----
 
 int main(int argc, char* argv[]) {
     if (argc != 2) {
@@ -319,28 +243,18 @@ int main(int argc, char* argv[]) {
 
     const std::string config_path = "./config_servers.txt";
     std::ifstream file(config_path);
-    if (!file.is_open()) {
-        std::cerr << "Failed to open config file\n";
-        return 1;
-    }
+    if (!file.is_open()) { std::cerr << "Failed to open config file\n"; return 1; }
 
     std::vector<std::string> addresses;
     std::string line;
-    while (std::getline(file, line)) {
-        if (!line.empty()) {
-            addresses.push_back(line);
-        }
-    }
+    while (std::getline(file, line))
+        if (!line.empty()) addresses.push_back(line);
 
     num_nodes = addresses.size();
-    if (my_node_id < 0 || my_node_id >= num_nodes) {
-        std::cerr << "Invalid node_id\n";
-        return 1;
-    }
+    if (my_node_id < 0 || my_node_id >= num_nodes) { std::cerr << "Invalid node_id\n"; return 1; }
 
     std::cout << "Total nodes: " << num_nodes << std::endl;
 
-    // ROUTER : point d'entrée de tous les messages entrants
     zmq::context_t context(1);
     zmq::socket_t router(context, zmq::socket_type::router);
     std::string identity = std::to_string(my_node_id);
@@ -349,38 +263,33 @@ int main(int argc, char* argv[]) {
     router.bind(addresses[my_node_id]);
     std::cout << "Node " << my_node_id << " bound to " << addresses[my_node_id] << std::endl;
 
-    // Sockets PAIR internes pour recevoir les notifications des threads
-    // pair_pull     : watchdog_thread → job background terminé
-    // pair_nodedead : heartbeat_thread → noeud mort détecté
     zmq::socket_t pair_pull(context, zmq::socket_type::pair);
     pair_pull.bind("inproc://jobdone");
 
     zmq::socket_t pair_nodedead(context, zmq::socket_type::pair);
     pair_nodedead.bind("inproc://nodedead");
 
-    // Initialiser les DEALERs vers les autres noeuds
     peers.resize(num_nodes);
     for (int j = 0; j < num_nodes; ++j) {
-        if (j == my_node_id) {
-            continue;
-        }
+        if (j == my_node_id) continue;
         peers[j].dealer = std::make_unique<zmq::socket_t>(context, zmq::socket_type::dealer);
         peers[j].dealer->set(zmq::sockopt::routing_id, identity);
         peers[j].dealer->set(zmq::sockopt::linger, 0);
         peers[j].dealer->connect(addresses[j]);
 
-        // Premier heartbeat pour que les autres noeuds nous connaissent dès le démarrage
-        dealer_send(*peers[j].dealer, MessageType::Heartbeat, getLoadAverage());
-        std::cout << "Connected to node " << j << std::endl;
+        std::string payload = getLoadAverage();
+        uint8_t type_byte = static_cast<uint8_t>(MessageType::Heartbeat);
+        zmq::message_t type_frame(sizeof(uint8_t));
+        memcpy(type_frame.data(), &type_byte, sizeof(uint8_t));
+        zmq::message_t payload_frame(payload.begin(), payload.end());
+        peers[j].dealer->send(type_frame, zmq::send_flags::sndmore);
+        peers[j].dealer->send(payload_frame, zmq::send_flags::none);
+        std::cout << "Connected to node " << j << " and sent load: " << payload << std::endl;
     }
 
     std::thread hb_thread(heartbeat_thread, std::cref(addresses), std::ref(context));
     std::thread wd_thread(watchdog_thread, std::ref(context));
 
-    // Receive loop : poll sur 3 sources simultanément
-    // items[0] router      : messages réseau (clients, autres noeuds)
-    // items[1] pair_pull   : watchdog (job background terminé)
-    // items[2] pair_nodedead : heartbeat (noeud mort)
     while (true) {
         zmq::pollitem_t items[] = {
             { static_cast<void*>(router),         0, ZMQ_POLLIN, 0 },
@@ -389,50 +298,85 @@ int main(int argc, char* argv[]) {
         };
         zmq::poll(items, 3, -1);
 
-        // Job background terminé — notifié par le watchdog via pair_pull
+        // ---- Watchdog : job terminé (foreground ou background) ----
         if (items[1].revents & ZMQ_POLLIN) {
             zmq::message_t notif;
             pair_pull.recv(notif);
             std::string msg(static_cast<char*>(notif.data()), notif.size());
 
-            // Parser "global_pid|sender_id|is_remote|output"
+            // Format : "global_pid|sender_id|is_remote|is_foreground|output"
             size_t sep1 = msg.find('|');
             size_t sep2 = msg.find('|', sep1 + 1);
             size_t sep3 = msg.find('|', sep2 + 1);
-            uint32_t global_pid = std::stoul(msg.substr(0, sep1));
+            size_t sep4 = msg.find('|', sep3 + 1);
+            uint32_t global_pid   = std::stoul(msg.substr(0, sep1));
             std::string sender_id = msg.substr(sep1 + 1, sep2 - sep1 - 1);
-            bool is_remote = msg.substr(sep2 + 1, sep3 - sep2 - 1) == "1";
-            std::string output = msg.substr(sep3 + 1);
-
-            std::string gpid_payload = "global_pid:" + std::to_string(global_pid) + "\n" + output;
+            bool is_remote        = msg.substr(sep2 + 1, sep3 - sep2 - 1) == "1";
+            bool is_foreground    = msg.substr(sep3 + 1, sep4 - sep3 - 1) == "1";
+            std::string output    = msg.substr(sep4 + 1);
 
             if (!is_remote) {
-                // Job local : notifier le client directement
-                router_send(router, sender_id, MessageType::JobFinished, gpid_payload);
-                std::cout << "[WD] Local job " << global_pid << " done, notified " << sender_id << std::endl;
+                if (is_foreground) {
+                    // Job fg local terminé — envoyer ClientReturnValue avec output
+                    // C'est la réponse que le client attend dans sa boucle zmq_recv
+                    std::string response = "global_pid:" + std::to_string(global_pid) + "\n" + output;
+                    uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientReturnValue);
+                    zmq::message_t resp_type_frame(sizeof(uint8_t));
+                    memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                    zmq::message_t resp_payload_frame(response.begin(), response.end());
+                    zmq::message_t client_frame(sender_id.begin(), sender_id.end());
+                    router.send(client_frame, zmq::send_flags::sndmore);
+                    router.send(resp_type_frame, zmq::send_flags::sndmore);
+                    router.send(resp_payload_frame, zmq::send_flags::none);
+                    std::cout << "[WD] FG job " << global_pid << " done, sent ClientReturnValue to " << sender_id << std::endl;
+                } else {
+                    // Job bg local terminé — envoyer JobFinished (notification async)
+                    std::string gpid_payload = "global_pid:" + std::to_string(global_pid) + "\n" + output;
+                    uint8_t resp_byte = static_cast<uint8_t>(MessageType::JobFinished);
+                    zmq::message_t resp_type_frame(sizeof(uint8_t));
+                    memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                    zmq::message_t resp_payload_frame(gpid_payload.begin(), gpid_payload.end());
+                    zmq::message_t client_frame(sender_id.begin(), sender_id.end());
+                    router.send(client_frame, zmq::send_flags::sndmore);
+                    router.send(resp_type_frame, zmq::send_flags::sndmore);
+                    router.send(resp_payload_frame, zmq::send_flags::none);
+                    std::cout << "[WD] BG job " << global_pid << " done, notified " << sender_id << std::endl;
+                }
             } else {
-                // Job remote : renvoyer RemoteJobFinished au noeud source
-                // qui transmettra ensuite JobFinished à son client
+                // Job remote terminé — renvoyer au nœud source
+                std::string gpid_payload = "global_pid:" + std::to_string(global_pid) + "\n" + output;
                 int source_node = std::stoi(sender_id);
-                dealer_send(*peers[source_node].dealer, MessageType::RemoteJobFinished, gpid_payload);
+                uint8_t resp_byte = static_cast<uint8_t>(MessageType::RemoteJobFinished);
+                zmq::message_t resp_type_frame(sizeof(uint8_t));
+                memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                zmq::message_t resp_payload_frame(gpid_payload.begin(), gpid_payload.end());
+                peers[source_node].dealer->send(resp_type_frame, zmq::send_flags::sndmore);
+                peers[source_node].dealer->send(resp_payload_frame, zmq::send_flags::none);
                 std::cout << "[WD] Remote job " << global_pid << " done, notified node " << source_node << std::endl;
             }
         }
 
-        // Noeud mort — notifié par heartbeat_thread via pair_nodedead
-        // Le client pourra relancer les jobs qui tournaient sur ce noeud
+        // ---- NodeDead : broadcaster à tous les clients connectés ----
         if (items[2].revents & ZMQ_POLLIN) {
             zmq::message_t notif;
             pair_nodedead.recv(notif);
             std::string dead_node_str(static_cast<char*>(notif.data()), notif.size());
 
-            if (!connected_client_id.empty()) {
-                router_send(router, connected_client_id, MessageType::NodeDead, dead_node_str);
-                std::cout << "[ND] Node " << dead_node_str << " dead, notified " << connected_client_id << std::endl;
+            for (const std::string& client_id : connected_clients) {
+                uint8_t resp_byte = static_cast<uint8_t>(MessageType::NodeDead);
+                zmq::message_t resp_type_frame(sizeof(uint8_t));
+                memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                zmq::message_t resp_payload_frame(dead_node_str.begin(), dead_node_str.end());
+                zmq::message_t client_frame(client_id.begin(), client_id.end());
+                router.send(client_frame, zmq::send_flags::sndmore);
+                router.send(resp_type_frame, zmq::send_flags::sndmore);
+                router.send(resp_payload_frame, zmq::send_flags::none);
             }
+            std::cout << "[ND] Node " << dead_node_str << " dead, notified "
+                      << connected_clients.size() << " client(s)" << std::endl;
         }
 
-        // Messages réseau entrants
+        // ---- Message réseau ----
         if (items[0].revents & ZMQ_POLLIN) {
             zmq::message_t sender, type_frame, payload_frame;
             router.recv(sender);
@@ -448,8 +392,6 @@ int main(int argc, char* argv[]) {
             switch(type) {
 
                 case MessageType::Heartbeat: {
-                    // Mettre à jour la charge et le timestamp du pair
-                    // Si le pair est Dead, on ignore (on ne le réanime pas)
                     int indice = (sender_id.substr(0, 10) == "heartbeat_")
                         ? std::stoi(sender_id.substr(10)) : std::stoi(sender_id);
                     peers_mutex.lock();
@@ -468,18 +410,13 @@ int main(int argc, char* argv[]) {
                 }
 
                 case MessageType::ClientCommand: {
-                    // Décision de placement : exécuter localement ou rediriger ?
-                    // On redirige si notre charge > 1.5x la moyenne et qu'un noeud moins chargé existe
-                    float my_load = std::stof(getLoadAverage());
+                    float my_load = 999.0f; // std::stof(getLoadAverage());
                     peers_mutex.lock();
                     float global_charge = get_global_load(peers);
                     int target = select_target(my_node_id, peers);
                     peers_mutex.unlock();
 
                     if (my_load > global_charge * 1.5 && target != my_node_id) {
-                        // Jitter anti-thundering-herd : si plusieurs noeuds voient le même noeud
-                        // comme le moins chargé au même instant, le délai aléatoire désynchronise
-                        // leurs décisions. On recalcule la cible après le délai.
                         std::random_device rd;
                         std::mt19937 gen(rd());
                         std::uniform_int_distribution<> delay(0, 300);
@@ -494,59 +431,175 @@ int main(int argc, char* argv[]) {
                             bool background = !message.empty() && message.back() == '&';
                             std::cout << "[LB] Redirecting to node " << target
                                       << (background ? " (bg)" : " (fg)") << "\n";
-                            dealer_send(*peers[target].dealer, MessageType::RemoteCommand, message);
+
+                            if (background) {
+                                pending_bg_redirections.insert({target, sender_id});
+                            } else {
+                                pending_redirections[target] = sender_id;
+                            }
+
+                            uint8_t remote_byte = static_cast<uint8_t>(MessageType::RemoteCommand);
+                            zmq::message_t remote_type_frame(sizeof(uint8_t));
+                            memcpy(remote_type_frame.data(), &remote_byte, sizeof(uint8_t));
+                            zmq::message_t remote_payload(message.begin(), message.end());
+                            peers[target].dealer->send(remote_type_frame, zmq::send_flags::sndmore);
+                            peers[target].dealer->send(remote_payload, zmq::send_flags::none);
                             break;
                         }
                     }
 
-                    // Exécution locale
                     {
                         bool background = !message.empty() && message.back() == '&';
-                        auto [global_pid, output] = fork_and_exec(message, background, sender_id, false);
-                        std::string response_payload = build_response(global_pid, output, background);
-                        // Répondre au client en utilisant sender (frame d'identité reçue)
-                        std::string sid(static_cast<char*>(sender.data()), sender.size());
-                        router_send(router, sid, MessageType::ClientReturnValue, response_payload);
+                        uint32_t global_pid = fork_and_exec(message, background, sender_id, false,
+                            [&](uint32_t gpid) {
+                                // Envoyer ClientPid immédiatement après le fork
+                                uint8_t pid_byte = static_cast<uint8_t>(MessageType::ClientPid);
+                                zmq::message_t pid_type(sizeof(uint8_t));
+                                memcpy(pid_type.data(), &pid_byte, sizeof(uint8_t));
+                                std::string gpid_str = std::to_string(gpid);
+                                zmq::message_t pid_payload(gpid_str.begin(), gpid_str.end());
+                                zmq::message_t client_frame(sender_id.begin(), sender_id.end());
+                                router.send(client_frame, zmq::send_flags::sndmore);
+                                router.send(pid_type, zmq::send_flags::sndmore);
+                                router.send(pid_payload, zmq::send_flags::none);
+                            }
+                        );
+                        // Pour les jobs background, on envoie le global_pid immédiatement
+                        // Pour les jobs foreground, le watchdog enverra ClientReturnValue + output
+                        // quand le process se termine — le client reste en attente
+                        if (background) {
+                            std::string response = build_response(global_pid, background);
+                            uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientReturnValue);
+                            zmq::message_t resp_type_frame(sizeof(uint8_t));
+                            memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                            zmq::message_t resp_payload_frame(response.begin(), response.end());
+                            router.send(sender, zmq::send_flags::sndmore);
+                            router.send(resp_type_frame, zmq::send_flags::sndmore);
+                            router.send(resp_payload_frame, zmq::send_flags::none);
+                        }
+                        // Si foreground : pas de réponse ici — le watchdog s'en charge
                     }
                     break;
                 }
 
                 case MessageType::RemoteCommand: {
-                    // Un autre noeud nous délègue une commande
-                    // On répond via peers[source_node].dealer car le router de l'autre noeud
-                    // identifie notre dealer par notre node_id identity
                     bool background = !message.empty() && message.back() == '&';
-                    auto [global_pid, output] = fork_and_exec(message, background, sender_id, true);
-                    std::string response_payload = build_response(global_pid, output, background);
-                    int source_node = std::stoi(sender_id);
-                    dealer_send(*peers[source_node].dealer, MessageType::RemoteReturnValue, response_payload);
+                    uint32_t global_pid = fork_and_exec(message, background, sender_id, true);
+                    // Pour foreground remote : le watchdog envoie RemoteJobFinished
+                    // qui sera relayé en ClientReturnValue par le nœud source
+                    // Pour background remote : idem, RemoteJobFinished
+                    // On envoie RemoteReturnValue immédiatement seulement pour background
+                    if (background) {
+                        std::string response = build_response(global_pid, background);
+                        int source_node = std::stoi(sender_id);
+                        uint8_t resp_byte = static_cast<uint8_t>(MessageType::RemoteReturnValue);
+                        zmq::message_t resp_type_frame(sizeof(uint8_t));
+                        memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                        zmq::message_t resp_payload_frame(response.begin(), response.end());
+                        peers[source_node].dealer->send(resp_type_frame, zmq::send_flags::sndmore);
+                        peers[source_node].dealer->send(resp_payload_frame, zmq::send_flags::none);
+                    }
+                    // Si foreground remote : le watchdog enverra RemoteJobFinished avec output
                     break;
                 }
 
                 case MessageType::RemoteReturnValue: {
-                    // Résultat d'une commande foreground exécutée sur un autre noeud
-                    // On transmet directement au client connecté
-                    router_send(router, connected_client_id, MessageType::ClientReturnValue, message);
+                    int source_node = std::stoi(sender_id);
+
+                    auto it = pending_redirections.find(source_node);
+                    if (it != pending_redirections.end()) {
+                        std::string client_id = it->second;
+                        pending_redirections.erase(it);
+
+                        uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientReturnValue);
+                        zmq::message_t resp_type_frame(sizeof(uint8_t));
+                        memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                        zmq::message_t resp_payload_frame(message.begin(), message.end());
+                        zmq::message_t client_frame(client_id.begin(), client_id.end());
+                        router.send(client_frame, zmq::send_flags::sndmore);
+                        router.send(resp_type_frame, zmq::send_flags::sndmore);
+                        router.send(resp_payload_frame, zmq::send_flags::none);
+                        break;
+                    }
+
+                    auto it2 = pending_bg_redirections.find(source_node);
+                    if (it2 != pending_bg_redirections.end()) {
+                        std::string client_id = it2->second;
+
+                        uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientReturnValue);
+                        zmq::message_t resp_type_frame(sizeof(uint8_t));
+                        memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                        zmq::message_t resp_payload_frame(message.begin(), message.end());
+                        zmq::message_t client_frame(client_id.begin(), client_id.end());
+                        router.send(client_frame, zmq::send_flags::sndmore);
+                        router.send(resp_type_frame, zmq::send_flags::sndmore);
+                        router.send(resp_payload_frame, zmq::send_flags::none);
+                        break;
+                    }
+
+                    std::cout << "[ERR] RemoteReturnValue from " << sender_id << " but no pending client\n";
                     break;
                 }
 
                 case MessageType::RemoteJobFinished: {
-                    // Job background distant terminé — transmettre JobFinished au client
-                    router_send(router, connected_client_id, MessageType::JobFinished, message);
-                    std::cout << "[WD] RemoteJobFinished forwarded to " << connected_client_id << std::endl;
+                    int source_node = std::stoi(sender_id);
+
+                    // Chercher d'abord dans pending_redirections (fg redirigé)
+                    auto it_fg = pending_redirections.find(source_node);
+                    if (it_fg != pending_redirections.end()) {
+                        std::string client_id = it_fg->second;
+                        pending_redirections.erase(it_fg);
+
+                        // Le watchdog du nœud distant envoie RemoteJobFinished avec output
+                        // On le relaye en ClientReturnValue au client
+                        uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientReturnValue);
+                        zmq::message_t resp_type_frame(sizeof(uint8_t));
+                        memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                        zmq::message_t resp_payload_frame(message.begin(), message.end());
+                        zmq::message_t client_frame(client_id.begin(), client_id.end());
+                        router.send(client_frame, zmq::send_flags::sndmore);
+                        router.send(resp_type_frame, zmq::send_flags::sndmore);
+                        router.send(resp_payload_frame, zmq::send_flags::none);
+                        std::cout << "[WD] Remote FG job done, sent ClientReturnValue to " << client_id << std::endl;
+                        break;
+                    }
+
+                    // Sinon c'est un bg redirigé
+                    auto it = pending_bg_redirections.find(source_node);
+                    if (it == pending_bg_redirections.end()) {
+                        std::cout << "[ERR] RemoteJobFinished from " << sender_id << " but no pending client\n";
+                        break;
+                    }
+                    std::string client_id = it->second;
+                    pending_bg_redirections.erase(it);
+
+                    uint8_t resp_byte = static_cast<uint8_t>(MessageType::JobFinished);
+                    zmq::message_t resp_type_frame(sizeof(uint8_t));
+                    memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                    zmq::message_t resp_payload_frame(message.begin(), message.end());
+                    zmq::message_t client_frame(client_id.begin(), client_id.end());
+                    router.send(client_frame, zmq::send_flags::sndmore);
+                    router.send(resp_type_frame, zmq::send_flags::sndmore);
+                    router.send(resp_payload_frame, zmq::send_flags::none);
+                    std::cout << "[WD] Remote BG job done, forwarded JobFinished to " << client_id << std::endl;
                     break;
                 }
 
                 case MessageType::ClientHandshake: {
-                    // Premier contact du client — stocker son identité pour les notifs async
-                    connected_client_id = sender_id;
-                    router_send(router, sender_id, MessageType::ClientAcknowledgement, "");
+                    connected_clients.insert(sender_id);
+                    uint8_t resp_byte = static_cast<uint8_t>(MessageType::ClientAcknowledgement);
+                    zmq::message_t resp_type_frame(sizeof(uint8_t));
+                    memcpy(resp_type_frame.data(), &resp_byte, sizeof(uint8_t));
+                    zmq::message_t resp_payload_frame;
+                    router.send(sender, zmq::send_flags::sndmore);
+                    router.send(resp_type_frame, zmq::send_flags::sndmore);
+                    router.send(resp_payload_frame, zmq::send_flags::none);
+                    std::cout << "[HS] Client " << sender_id << " connected ("
+                              << connected_clients.size() << " total)" << std::endl;
                     break;
                 }
 
                 case MessageType::RemoteKill: {
-                    // Kill d'un processus sur un noeud distant
-                    // Payload : "target_node:sig:local_pid"
                     auto p1 = message.find(':');
                     auto p2 = message.find(':', p1 + 1);
                     int target_node = std::stoi(message.substr(0, p1));
@@ -555,9 +608,13 @@ int main(int argc, char* argv[]) {
                     if (target_node == my_node_id) {
                         kill(lpid, sig);
                     } else {
-                        // Forward au bon noeud
                         std::string fwd = std::to_string(target_node) + ":" + std::to_string(sig) + ":" + std::to_string(lpid);
-                        dealer_send(*peers[target_node].dealer, MessageType::RemoteKill, fwd);
+                        uint8_t type_byte = static_cast<uint8_t>(MessageType::RemoteKill);
+                        zmq::message_t tf(sizeof(uint8_t));
+                        memcpy(tf.data(), &type_byte, sizeof(uint8_t));
+                        zmq::message_t pf(fwd.begin(), fwd.end());
+                        peers[target_node].dealer->send(tf, zmq::send_flags::sndmore);
+                        peers[target_node].dealer->send(pf, zmq::send_flags::none);
                     }
                     break;
                 }

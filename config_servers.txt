@@ -1,4 +1,4 @@
-tcp://ppti-14-302-01.ufr-info-p6.jussieu.fr:5000
-tcp://ppti-14-302-02.ufr-info-p6.jussieu.fr:5001
-tcp://ppti-14-302-03.ufr-info-p6.jussieu.fr:5002
-tcp://ppti-14-302-04.ufr-info-p6.jussieu.fr:5003
+tcp://127.0.0.1:5000
+tcp://127.0.0.1:5001
+tcp://127.0.0.1:5002
+tcp://127.0.0.1:5003
