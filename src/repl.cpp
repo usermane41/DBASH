@@ -21,10 +21,9 @@ static constexpr const char* PROMPT = "dbash> ";
 static zmq::context_t zmq_ctx{1};
 static zmq::socket_t  zmq_dealer{zmq_ctx, zmq::socket_type::dealer};
 
-// gpid du job foreground actuellement en attente de réponse.
-// 0 si aucun job foreground en cours.
-// Écrit par execute_command, lu par sigint_handler.
-static volatile uint32_t current_fg_gpid = 0;
+// Flag : un job foreground est-il en cours ?
+// true entre zmq_send(ClientCommand) et la réception de ClientReturnValue
+static volatile bool fg_running = false;
 
 /* ---------- forward declaration ---------- */
 static void execute_command(const Command& cmd);
@@ -57,9 +56,7 @@ static std::pair<MessageType, std::string> zmq_recv()
             );
             return {type, payload};
         } catch (const zmq::error_t& e) {
-            if (e.num() == EINTR) {
-                continue;
-            }
+            if (e.num() == EINTR) continue;
             throw;
         }
     }
@@ -67,16 +64,14 @@ static std::pair<MessageType, std::string> zmq_recv()
 
 /* ---------- SIGINT handler ---------- */
 
+// Ctrl+C : si un job foreground tourne, envoyer Stop au serveur.
+// Le serveur cherche le job fg associé à ce client et fait kill() lui-même.
+// Plus besoin de connaître le pid ou le nœud cible côté client.
 static void sigint_handler(int)
 {
-    if (current_fg_gpid > 1) {
-        // On a le vrai gpid — envoyer le kill directement
-        std::string payload = std::to_string(current_fg_gpid >> 16) + ":2:"
-                            + std::to_string(current_fg_gpid & 0xFFFF);
-        zmq_send(MessageType::RemoteKill, payload);
+    if (fg_running) {
+        zmq_send(MessageType::Stop, "");
     }
-    // Si current_fg_gpid == 1 (sentinelle) ou 0 : on ne fait rien,
-    // on attend que ClientPid arrive pour avoir le vrai gpid
 }
 
 /* ---------- handlers asynchrones ---------- */
@@ -84,9 +79,9 @@ static void sigint_handler(int)
 static void handle_job_finished(const std::string& payload)
 {
     uint32_t gpid = std::stoul(payload.substr(11, payload.find('\n') - 11));
-    std::string output = payload.find('\n') != std::string::npos 
+    std::string output = payload.find('\n') != std::string::npos
         ? payload.substr(payload.find('\n') + 1) : "";
-    
+
     std::lock_guard<std::mutex> lock(job_mutex);
     for (Job& j : job_table) {
         if (j.global_pid == gpid) {
@@ -222,20 +217,15 @@ static void execute_command(const Command& cmd)
 
     zmq_send(MessageType::ClientCommand, command_str);
 
+    // Armer le flag fg_running avant le recv bloquant
     if (!cmd.background) {
-        current_fg_gpid = 1;  // sentinelle : fg job en attente, vrai gpid pas encore connu
+        fg_running = true;
     }
 
     MessageType type;
     std::string payload;
     while (true) {
         auto [t, p] = zmq_recv();
-        if (t == MessageType::ClientPid) {
-            // Vrai gpid reçu juste après le fork côté serveur
-            // Si Ctrl+C était arrivé pendant la sentinelle, on envoie le kill maintenant
-            current_fg_gpid = std::stoul(p);
-            continue;
-        }
         if (t == MessageType::JobFinished) {
             handle_job_finished(p);
             continue;
@@ -247,6 +237,11 @@ static void execute_command(const Command& cmd)
         type = t;
         payload = p;
         break;
+    }
+
+    // Job foreground terminé
+    if (!cmd.background) {
+        fg_running = false;
     }
 
     if (type == MessageType::ClientReturnValue) {
@@ -261,7 +256,9 @@ static void execute_command(const Command& cmd)
             j.local_pid  = gpid & 0xFFFF;
             j.global_pid = gpid;
             j.node_id    = gpid >> 16;
-            j.command    = cmd.background ? command_str.substr(0, command_str.size() - 2) : command_str;
+            j.command    = cmd.background
+                ? command_str.substr(0, command_str.size() - 2)
+                : command_str;
             j.background = cmd.background;
             j.finished   = !cmd.background;
             j.failed     = false;
@@ -271,10 +268,6 @@ static void execute_command(const Command& cmd)
         } else {
             std::cout << payload;
         }
-    }
-
-    if (!cmd.background) {
-        current_fg_gpid = 0;
     }
 
     check_job_notifications();
