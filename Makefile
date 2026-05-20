@@ -1,6 +1,6 @@
 CXX      = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -g -Isrc -I.
-LDFLAGS  = -lreadline -lpthread -lzmq
+LDFLAGS  = -L./lib -lreadline -lpthread -lzmq -Wl,-rpath,'$$ORIGIN/lib'
 
 # ---- Shell (dbash) ----
 SHELL_SRC = src/main.cpp src/repl.cpp src/parser.cpp src/job_table.cpp src/load_balancer.cpp
