@@ -1,3 +1,10 @@
+ne pas faire attention
+
+
+
+
+
+
 # Créer les répertoires de travail
 mkdir /tmp/node0 /tmp/node1 /tmp/node2 /tmp/node3
 
@@ -18,3 +25,61 @@ cd /tmp/node3 && ~/Bureau/DBASH/server 3
 
 # Lancer le shell
 cd ~/Bureau/DBASH && ./dbash 0
+
+
+CXX      = g++
+CXXFLAGS = -std=c++17 -Wall -Wextra -g -Isrc -I.
+LDFLAGS  = -lreadline -lpthread -lzmq
+
+# ---- Shell (dbash) ----
+SHELL_SRC = src/main.cpp src/repl.cpp src/parser.cpp src/job_table.cpp src/load_balancer.cpp
+SHELL_OBJ = $(SHELL_SRC:.cpp=.o)
+SHELL_BIN = dbash
+
+# ---- Serveur daemon ----
+SERVER_SRC = proto-nicolas/server.cpp src/load_balancer.cpp
+SERVER_OBJ = $(SERVER_SRC:.cpp=.o)
+SERVER_BIN = server
+
+.PHONY: all clean
+
+all: $(SHELL_BIN) $(SERVER_BIN)
+
+$(SHELL_BIN): $(SHELL_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+$(SERVER_BIN): $(SERVER_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+clean:
+	rm -f $(SHELL_OBJ) $(SERVER_OBJ) $(SHELL_BIN) $(SERVER_BIN)
+
+#!/bin/bash
+
+# Bash benchmarks
+for N in 1 2 4 8 12 16 24 32 48 64 96 128 164 200 ; do
+    echo -n "bash ${N} jobs: " >> results.txt
+    { time (for i in $(seq 1 $N); do python3 bench.py & done; wait); } 2>&1 | grep real >> results.txt
+done
+
+# DBash benchmarks
+for N in 1 2 4 8 12 16 24 32 48 64 96 128 164 200; do
+    CMD=""
+    for i in $(seq 1 $N); do CMD="${CMD}python3 bench.py &\n"; done
+    CMD="${CMD}wait"
+    echo -n "dbash ${N} jobs: " >> results.txt
+    { time echo -e "$CMD" | ./dbash 0 2>/dev/null; } 2>&1 | grep real >> results.txt
+done
+
+
+tcp://132.227.112.193:5000
+tcp://132.227.112.194:5000
+tcp://132.227.112.195:5000
+tcp://132.227.112.197:5000
+tcp://132.227.112.199:5000
+tcp://132.227.112.200:5000
+tcp://132.227.112.202:5000
+tcp://132.227.112.203:5000

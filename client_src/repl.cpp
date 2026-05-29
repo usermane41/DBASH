@@ -18,11 +18,12 @@
 
 static constexpr const char* PROMPT = "dbash> ";
 
+//socket de comunication dealer
 static zmq::context_t zmq_ctx{1};
 static zmq::socket_t  zmq_dealer{zmq_ctx, zmq::socket_type::dealer};
 
-// Flag : un job foreground est-il en cours ?
-// true entre zmq_send(ClientCommand) et la réception de ClientReturnValue
+// true entre l'envoi d'une ClientCommand foreground et la réception de ClientReturnValue
+// le handler SIGINT s'en sert pour savoir s'il doit envoyer Stop ou juste afficher ^C
 static volatile bool fg_running = false;
 
 /* ---------- forward declaration ---------- */
@@ -30,6 +31,7 @@ static void execute_command(const Command& cmd);
 
 /* ---------- helpers ZeroMQ ---------- */
 
+// envoi 2 frames : type + payload
 static void zmq_send(MessageType type, const std::string& payload)
 {
     uint8_t type_byte = static_cast<uint8_t>(type);
@@ -39,6 +41,9 @@ static void zmq_send(MessageType type, const std::string& payload)
     zmq_dealer.send(payload_frame, zmq::send_flags::none);
 }
 
+// recv bloquant — relance automatiquement si interrompu par SIGINT (EINTR)
+//catch nécessaire car une fois reveiller pour traiter le signal 
+//on ne reprend pas son attente
 static std::pair<MessageType, std::string> zmq_recv()
 {
     while (true) {
@@ -56,7 +61,7 @@ static std::pair<MessageType, std::string> zmq_recv()
             );
             return {type, payload};
         } catch (const zmq::error_t& e) {
-            if (e.num() == EINTR) continue;
+            if (e.num() == EINTR) continue; // interrompu par le signal, on relance
             throw;
         }
     }
@@ -64,25 +69,30 @@ static std::pair<MessageType, std::string> zmq_recv()
 
 /* ---------- SIGINT handler ---------- */
 
-// Ctrl+C : si un job foreground tourne, envoyer Stop au serveur.
-// Le serveur cherche le job fg associé à ce client et fait kill() lui-même.
-// Plus besoin de connaître le pid ou le nœud cible côté client.
+// on ne tue pas le processus directement depuis ici — on ne connaît pas son pid
+// le server maintient background_jobs et sait quel job foreground appartient à ce client
 static void sigint_handler(int)
 {
     if (fg_running) {
         zmq_send(MessageType::Stop, "");
     }
+    // si pas de job fg en cours, readline se débrouille (affiche ^C et remet le prompt)
 }
 
 /* ---------- handlers asynchrones ---------- */
 
+// notification de fin de job background — peut arriver n'importe quand
+// entre deux commandes ou pendant un wait()
+//(c'est ici qu'il aurait fallur trafiquer des choses pour mettre le resultat
+//dans flux demander par l'application tournant sur le dbash
+//GlobalPid: [numéro]\n[Le résultat textuel de la commande...] payload qu'on reçoit
 static void handle_job_finished(const std::string& payload)
 {
     uint32_t gpid = std::stoul(payload.substr(11, payload.find('\n') - 11));
     std::string output = payload.find('\n') != std::string::npos
         ? payload.substr(payload.find('\n') + 1) : "";
 
-    std::lock_guard<std::mutex> lock(job_mutex);
+    std::lock_guard<std::mutex> lock(job_mutex);//useless un peu
     for (Job& j : job_table) {
         if (j.global_pid == gpid) {
             j.finished = true;
@@ -93,6 +103,8 @@ static void handle_job_finished(const std::string& payload)
     }
 }
 
+// un nœud est mort — on marque ses jobs comme failed et on les relance ailleurs
+// le load balancer choisira un nœud disponible parmi les survivants
 static void handle_node_dead(int dead_node)
 {
     std::vector<std::string> relancer;
@@ -114,9 +126,13 @@ static void handle_node_dead(int dead_node)
 
 /* ---------- check notifications ---------- */
 
+// polling non-bloquant (timeout 10ms) pour vider les notifications en attente
+// appelé dans ps, wait, et après chaque commande
+//ici on ne veut pas que le client s'endorme si le réseau est vide.
+//donc poll.
 static void check_job_notifications()
 {
-    zmq::pollitem_t items[] = {
+    zmq::pollitem_t items[] = {//j'indique ce que je veux surveiller
         { static_cast<void*>(zmq_dealer), 0, ZMQ_POLLIN, 0 }
     };
     int rc = zmq::poll(items, 1, std::chrono::milliseconds(10));
@@ -141,7 +157,7 @@ static void check_job_notifications()
 
 static void builtin_ps()
 {
-    check_job_notifications();
+    check_job_notifications(); // on vide les notifications avant d'afficher
     std::lock_guard<std::mutex> lock(job_mutex);
     std::cout << "global_pid   node   command   status   failed\n";
     for (Job& j : job_table) {
@@ -154,6 +170,7 @@ static void builtin_ps()
 
 static void builtin_wait_all()
 {
+    // boucle jusqu'à ce que tous les jobs background soient terminés
     bool finished = false;
     while (!finished) {
         check_job_notifications();
@@ -172,7 +189,7 @@ static void builtin_wait_all()
 
 static void builtin_kill(const Command& cmd)
 {
-    int      sig  = std::stoi(cmd.args[1].substr(1));
+    int      sig  = std::stoi(cmd.args[1].substr(1)); // "-9" → 9
     uint32_t gpid = std::stoul(cmd.args[2]);
 
     Job* j = find_job(gpid);
@@ -181,8 +198,11 @@ static void builtin_kill(const Command& cmd)
         return;
     }
     if (j->node_id == my_node_id) {
+        // job local : kill direct
         kill(j->local_pid, sig);
     } else {
+        // job distant : on envoie RemoteKill au server
+        // lui se charge de le router vers le bon nœud
         std::string payload = std::to_string(j->node_id) + ":"
                             + std::to_string(sig) + ":"
                             + std::to_string(j->local_pid);
@@ -208,6 +228,7 @@ static void execute_command(const Command& cmd)
 {
     if (handle_builtin(cmd)) return;
 
+    // reconstruction de la commande en string pour l'envoyer au server
     std::string command_str;
     for (const auto& arg : cmd.args) {
         if (!command_str.empty()) command_str += " ";
@@ -217,11 +238,15 @@ static void execute_command(const Command& cmd)
 
     zmq_send(MessageType::ClientCommand, command_str);
 
-    // Armer le flag fg_running avant le recv bloquant
+    // on arme fg_running avant le recv bloquant
+    // comme ça le handler SIGINT peut envoyer Stop si Ctrl+C arrive pendant l'attente
     if (!cmd.background) {
         fg_running = true;
     }
 
+    // boucle de réception — on ignore les notifications asynchrones
+    // (JobFinished, NodeDead) et on attend ClientReturnValue
+    //pour bien bloquer le shell 
     MessageType type;
     std::string payload;
     while (true) {
@@ -238,8 +263,7 @@ static void execute_command(const Command& cmd)
         payload = p;
         break;
     }
-
-    // Job foreground terminé
+    //bon meme avec & on bloque quand meme quelque ms .
     if (!cmd.background) {
         fg_running = false;
     }
@@ -252,15 +276,16 @@ static void execute_command(const Command& cmd)
             std::string output = (newline != std::string::npos)
                 ? payload.substr(newline + 1) : "";
 
+            // enregistrement dans la job_table locale
             Job j;
-            j.local_pid  = gpid & 0xFFFF;
+            j.local_pid  = gpid & 0xFFFF;      // 16 bits de poids faible
             j.global_pid = gpid;
-            j.node_id    = gpid >> 16;
+            j.node_id    = gpid >> 16;          // 16 bits de poids fort
             j.command    = cmd.background
                 ? command_str.substr(0, command_str.size() - 2)
                 : command_str;
             j.background = cmd.background;
-            j.finished   = !cmd.background;
+            j.finished   = !cmd.background;    // fg déjà terminé, bg encore en cours
             j.failed     = false;
             add_job(j);
 
@@ -281,6 +306,7 @@ void repl_run(int node_id)
     std::ifstream file(config_path);
     if (!file) { std::cerr << "Failed to open config file\n"; exit(1); }
 
+    //on creait une liste de server aux quel on peut se connecter 
     std::vector<std::string> endpoints;
     std::string line;
     while (std::getline(file, line))
@@ -291,11 +317,13 @@ void repl_run(int node_id)
         exit(1);
     }
 
+    // identity basée sur getpid() → unique même si plusieurs dbash sur la même machine
     std::string identity = "client_" + std::to_string(getpid());
     zmq_dealer.set(zmq::sockopt::routing_id, identity);
     zmq_dealer.set(zmq::sockopt::linger, 0);
     zmq_dealer.connect(endpoints[node_id]);
 
+    // handshake initial — le server enregistre notre routing_id dans connected_clients
     zmq_send(MessageType::ClientHandshake, "");
     auto [ack_type, ack_payload] = zmq_recv();
     if (ack_type != MessageType::ClientAcknowledgement) {
@@ -303,11 +331,15 @@ void repl_run(int node_id)
         exit(1);
     }
 
+    // installation du handler SIGINT après le handshake
+    // avant ça on ne peut pas envoyer Stop (pas encore connecté)
     struct sigaction sa{};
     sa.sa_handler = sigint_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
+
+    std::cout << "D-bash — shell réparti\nTape 'exit' ou Ctrl+D pour quitter.\n";
 
     char* raw;
     while ((raw = readline(PROMPT)) != nullptr) {
@@ -323,3 +355,15 @@ void repl_run(int node_id)
     std::cout << "\n";
     builtin_exit();
 }
+
+/*
+std::thread notif_thread([&]() {
+    while (true) {
+        check_job_notifications();
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+});
+notif_thread.detach();*///
+//detach() dit au thread de tourner de façon indépendante 
+//j'ai enlever ce mecanisme car j'ai pas envie d'avoir des
+//notification qui pop de nulle part. 

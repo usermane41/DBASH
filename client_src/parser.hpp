@@ -11,6 +11,7 @@ struct Command {
     bool background = false;        // true si la commande se termine par '&'
 
     // Construit le tableau argv[] null-terminated pour execvp()
+    //jamais utiliser au final
     std::vector<char*> argv() const;
 
     bool empty() const { return args.empty(); }

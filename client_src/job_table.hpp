@@ -19,9 +19,8 @@ struct Job{
 };
 
 extern std::vector<Job> job_table;//la liste de tout les job
-extern std::mutex job_mutex; //mutex qui delay les signaux lorsqu'onpush back
+extern std::mutex job_mutex; //mutex qui delay les signaux lorsqu'on push back
 
 void add_job(Job j);
 Job* find_job(uint32_t j);//servira pour le kill
 void mark_finished(pid_t local_pid);//pour le wait
-void sigchld_handler(int sig);

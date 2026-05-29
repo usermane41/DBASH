@@ -15,7 +15,7 @@ enum class Liveness : uint8_t {
 struct PeerInfo {
     float load = 0.0f;
     std::chrono::steady_clock::time_point last_heartbeat;
-    std::unique_ptr<zmq::socket_t> dealer;
+    std::unique_ptr<zmq::socket_t> dealer;//tab de socket DEALER connectée vers chacun des autres serveurs du cluster. 
     Liveness status = Liveness::Uninitialized;
 };
 

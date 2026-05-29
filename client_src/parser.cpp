@@ -27,7 +27,8 @@ Command parse_line(const std::string& line)
 
     return cmd;
 }
-
+//pour passer de c++ a c (xecvp exige un tableau de pointeurs sur des caractères
+//et pas un std::vector
 std::vector<char*> Command::argv() const
 {
     std::vector<char*> v;
@@ -37,3 +38,10 @@ std::vector<char*> Command::argv() const
     v.push_back(nullptr);
     return v;
 }
+//v.push_back(const_cast<char*>(s.c_str()));
+//on extrait de manière brut la chaine de caractère pour quel 
+//soit compatible en c 
+//ensuite on cast le pointeur en lecteure seul qu'on recoit
+//car les fonctions exec de Linux demandent un tableau de char* 
+//modifiables (même si elles n'y touchent pas vraiment). Le const_cast retire la sécurité const 
+//pour faire plaisir à l'appel système.

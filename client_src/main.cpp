@@ -1,7 +1,6 @@
 #include <iostream>
 #include "repl.hpp"
-#include <csignal>      // signal(), SIGCHLD
-#include "job_table.hpp"     // sigchld_handler
+#include "job_table.hpp"     
 int my_node_id;
 int main(int argc, char* argv[])
 {
@@ -13,7 +12,7 @@ int main(int argc, char* argv[])
     my_node_id = node_id; 
     std::cout << "D-bash — shell réparti\n";
     std::cout << "Tape 'exit' ou Ctrl+D pour quitter.\n\n";
-    signal(SIGCHLD, sigchld_handler);
+    
     repl_run(node_id);
     return 0;
 }

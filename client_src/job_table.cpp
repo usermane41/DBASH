@@ -1,7 +1,6 @@
 #include "job_table.hpp"
 std::vector<Job> job_table;
 std::mutex job_mutex;
-std::atomic<bool> sigchld_received{false};
 
 void add_job(Job j){
     std::lock_guard<std::mutex> lock(job_mutex);
@@ -25,9 +24,5 @@ void mark_finished(pid_t local_pid){
             j.finished=true;
         }
     }
-}
-
-void sigchld_handler(int sig){
-   sigchld_received = true;
 }
 
