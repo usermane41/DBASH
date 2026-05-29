@@ -1,8 +1,6 @@
 # D-Bash
 
-> Shell distribué à répartition de charge sur un cluster de machines — M1 SAR, Sorbonne Université
-
-**Abdulrahim Atteib Doutoum** · Encadrant : Pierre Sens · 2025–2026
+> Shell distribué à répartition de charge sur un cluster de machines 
 
 ---
 
